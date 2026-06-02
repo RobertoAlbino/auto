@@ -40,12 +40,3 @@ auto codex
 auto            # default: claude
 auto update     # self-update (git pull) in the install directory
 ```
-
-### Updating
-
-Since `auto` is installed from a git checkout, `auto update` simply runs
-`git pull --ff-only` in the directory where the real script lives (symlinks on
-your PATH are resolved first). It is fast-forward only, so it never creates a
-merge commit or clobbers local changes — if the pull can't fast-forward, git
-says so and nothing is changed. If the install directory is not a git checkout,
-`auto update` prints a message and exits non-zero instead of doing anything.
