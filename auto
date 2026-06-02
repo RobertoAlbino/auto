@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""
+auto — runs `claude` or `codex` inside a pseudo-terminal (PTY) and
+automatically answers "yes" every time the tool pauses to ask for
+confirmation.
+
+Usage:
+    auto claude
+    auto codex
+    auto            # default: claude
+    auto update     # self-update via `git pull` in the install directory
+
+Apart from the `update` subcommand, there are no other options and no
+alternative command: it just launches the chosen tool and auto-accepts the
+confirmation prompts.
+
+SECURITY WARNING: auto-accepting EVERYTHING also bypasses confirmations for
+destructive actions. Prefer running it inside a throwaway directory. See
+README.md.
+"""
+
+import errno
+import fcntl
+import os
+import pty
+import re
+import select
+import signal
+import struct
+import subprocess
+import sys
+import termios
+import time
+import tty
+
+ENTER = b"\r"
+
+# Supported tools. Each one: a list of (prompt regex, key(s) to send).
+# The first rule that matches the visible "tail" of the screen wins.
+TOOLS = {
+    "claude": [
+        (r"Do you want to (proceed|make this edit|create|run)", ENTER),
+        (r"❯\s*1\.\s*Yes", ENTER),
+        (r"\b1\.\s*Yes\b.*\b2\.\s*", ENTER),
+    ],
+    "codex": [
+        (r"Allow.*\?", ENTER),
+        (r"Approve", ENTER),
+        (r"❯\s*1\.\s*Yes", ENTER),
+        (r"\(y/n\)", b"y\r"),
+    ],
+}
+
+# Regex that strips ANSI escape sequences (colors, cursor positioning, etc.).
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[\(\)][AB012]|\x1b[=>]|\r")
+
+BUFFER_LIMIT = 8192          # raw bytes kept for detection
+TAIL_LINES = 12              # how many visible lines to inspect when matching
+IDLE_SECS = 0.4              # output inactivity before checking for a prompt
+
+
+def resolve_tool(argv):
+    """Return the tool name from argv (defaults to "claude").
+
+    argv is expected to look like sys.argv: argv[0] is the program name and
+    argv[1], if present, is the tool to run.
+    """
+    return argv[1] if len(argv) > 1 else "claude"
+
+
+def compile_patterns(tool):
+    """Compile the prompt patterns for a tool into (regex, keys) pairs.
+
+    Raises KeyError if the tool is unknown.
+    """
+    return [(re.compile(rx, re.IGNORECASE), keys) for rx, keys in TOOLS[tool]]
+
+
+def strip_ansi(text):
+    """Remove ANSI escape sequences and carriage returns from text."""
+    return ANSI_RE.sub("", text)
+
+
+def visible_tail(raw_buffer, tail_lines=TAIL_LINES):
+    """Strip ANSI codes and return the last `tail_lines` lines as one string."""
+    text = strip_ansi(raw_buffer.decode("utf-8", errors="replace"))
+    lines = text.split("\n")
+    return "\n".join(lines[-tail_lines:])
+
+
+def match_prompt(tail, patterns):
+    """Return the key(s) to send for the first matching pattern, else None.
+
+    `patterns` is a list of (compiled_regex, keys) pairs, as produced by
+    compile_patterns.
+    """
+    for rx, keys in patterns:
+        if rx.search(tail):
+            return keys
+    return None
+
+
+def install_dir(path=None):
+    """Return the directory of the real `auto` script, resolving symlinks.
+
+    `auto` is typically installed as a symlink on the PATH pointing at a git
+    checkout, so the actual repository lives at the symlink's target.
+    """
+    return os.path.dirname(os.path.realpath(path or __file__))
+
+
+def update(repo=None, runner=subprocess.call):
+    """Self-update the install with `git pull --ff-only`. Return an exit code.
+
+    `repo` defaults to the install directory; `runner` runs the git command
+    (injectable for testing). Returns 1 if `repo` is not a git checkout,
+    otherwise the exit code reported by git.
+    """
+    repo = repo if repo is not None else install_dir()
+    if not os.path.isdir(os.path.join(repo, ".git")):
+        sys.stderr.write(
+            f"auto: {repo!r} is not a git checkout; cannot self-update.\n"
+        )
+        return 1
+    return runner(["git", "-C", repo, "pull", "--ff-only"])
+
+
+def get_winsize(fd):
+    """Return the (rows, cols) window size of fd, defaulting to (24, 80)."""
+    try:
+        data = fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\x00" * 8)
+        rows, cols, _, _ = struct.unpack("HHHH", data)
+        return rows, cols
+    except OSError:
+        return 24, 80
+
+
+def set_winsize(fd, rows, cols):
+    """Set the window size of fd to (rows, cols), ignoring errors."""
+    try:
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    except OSError:
+        pass
+
+
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv
+    tool = resolve_tool(argv)
+    if tool == "update":
+        sys.exit(update())
+    if tool not in TOOLS:
+        sys.stderr.write(
+            f"auto: tool {tool!r} is not supported. "
+            f"Use: {' or '.join(sorted(TOOLS))} (or 'update').\n"
+        )
+        sys.exit(2)
+
+    patterns = compile_patterns(tool)
+    target = [tool]
+
+    stdin_fd = sys.stdin.fileno()
+    stdout_fd = sys.stdout.fileno()
+
+    rows, cols = get_winsize(stdin_fd)
+
+    pid, master_fd = pty.fork()
+    if pid == 0:
+        # ---- child process ----
+        try:
+            os.execvp(target[0], target)
+        except OSError as e:
+            sys.stderr.write(f"auto: could not run {target[0]!r}: {e}\n")
+            os._exit(127)
+
+    # ---- parent process ----
+    set_winsize(master_fd, rows, cols)
+
+    def handle_winch(signum, frame):
+        r, c = get_winsize(stdin_fd)
+        set_winsize(master_fd, r, c)
+
+    signal.signal(signal.SIGWINCH, handle_winch)
+
+    old_term = None
+    if os.isatty(stdin_fd):
+        old_term = termios.tcgetattr(stdin_fd)
+        tty.setraw(stdin_fd)
+
+    raw_buffer = bytearray()
+    last_output = time.monotonic()
+    pending_check = False           # there is new output not yet analyzed
+    last_answered_tail = None       # avoid answering the same screen repeatedly
+    exit_code = 0
+
+    try:
+        while True:
+            timeout = IDLE_SECS if pending_check else None
+            try:
+                rlist, _, _ = select.select([stdin_fd, master_fd], [], [], timeout)
+            except select.error as e:
+                if e.args[0] == errno.EINTR:
+                    continue  # interrupted by SIGWINCH; resume
+                raise
+
+            if master_fd in rlist:
+                try:
+                    data = os.read(master_fd, 4096)
+                except OSError:
+                    data = b""
+                if not data:
+                    break  # child closed the PTY -> it exited
+                os.write(stdout_fd, data)
+                raw_buffer.extend(data)
+                if len(raw_buffer) > BUFFER_LIMIT:
+                    del raw_buffer[:-BUFFER_LIMIT]
+                last_output = time.monotonic()
+                pending_check = True
+
+            if stdin_fd in rlist:
+                try:
+                    user_in = os.read(stdin_fd, 4096)
+                except OSError:
+                    user_in = b""
+                if user_in:
+                    os.write(master_fd, user_in)
+                    # the user interacted: don't fight them on the current prompt
+                    last_answered_tail = None
+
+            # check for a prompt after an idle period
+            if pending_check and (time.monotonic() - last_output) >= IDLE_SECS:
+                pending_check = False
+                tail = visible_tail(bytes(raw_buffer))
+                keys = match_prompt(tail, patterns)
+                if keys is not None and tail != last_answered_tail:
+                    os.write(master_fd, keys)
+                    last_answered_tail = tail
+    finally:
+        if old_term is not None:
+            termios.tcsetattr(stdin_fd, termios.TCSAFLUSH, old_term)
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+        # reap the child and propagate its exit code
+        try:
+            _, status = os.waitpid(pid, 0)
+            if os.WIFEXITED(status):
+                exit_code = os.WEXITSTATUS(status)
+            elif os.WIFSIGNALED(status):
+                exit_code = 128 + os.WTERMSIG(status)
+        except OSError:
+            pass
+
+    sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()

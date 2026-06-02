@@ -1,0 +1,7 @@
+# Local Claude Code settings (not part of the project)
+.claude/
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
