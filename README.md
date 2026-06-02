@@ -40,3 +40,19 @@ auto codex
 auto            # default: claude
 auto update     # self-update (git pull) in the install directory
 ```
+
+## Platform support
+
+`auto` runs on **Linux and macOS**. Native **Windows is not supported**: the
+program is built on Unix-only standard-library modules (`pty`, `termios`,
+`tty`, `fcntl`) and on `select` over file descriptors, none of which exist or
+behave the same on Windows.
+
+On Windows you have two options:
+
+- **WSL (Windows Subsystem for Linux):** inside WSL it's just Linux, so `auto`
+  works unchanged. This is the recommended path.
+- **Skip `auto` and use the tools' native flags**, which work on any platform
+  and don't depend on scraping the TUI:
+  - Claude: `claude --dangerously-skip-permissions`
+  - Codex: `codex --dangerously-bypass-approvals-and-sandbox` (or `--full-auto`)
