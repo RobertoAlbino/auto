@@ -9,16 +9,6 @@ confirmation.
 The only argument is which tool to run (`claude` or `codex`). No other
 options and no alternative command.
 
-## Why a PTY (and not a pipe)?
-
-`claude` and `codex` are interactive TUIs: they detect whether they are
-attached to a real terminal and, outside of a TTY, change their behavior or
-refuse to run in interactive mode. That's why a pipe **does not work** — you
-have to run the tool inside a PTY, which is what this program does. On top of
-that, the confirmations are **arrow-key selection menus** ("❯ 1. Yes / 2. No"),
-not a plain-text `(y/n)`. Since the "Yes" option is usually pre-highlighted,
-answering = sending **Enter**.
-
 ## Installation
 
 No dependencies beyond Python 3 (it uses only the standard library).
@@ -43,16 +33,4 @@ auto update     # self-update (git pull) in the install directory
 
 ## Platform support
 
-`auto` runs on **Linux and macOS**. Native **Windows is not supported**: the
-program is built on Unix-only standard-library modules (`pty`, `termios`,
-`tty`, `fcntl`) and on `select` over file descriptors, none of which exist or
-behave the same on Windows.
-
-On Windows you have two options:
-
-- **WSL (Windows Subsystem for Linux):** inside WSL it's just Linux, so `auto`
-  works unchanged. This is the recommended path.
-- **Skip `auto` and use the tools' native flags**, which work on any platform
-  and don't depend on scraping the TUI:
-  - Claude: `claude --dangerously-skip-permissions`
-  - Codex: `codex --dangerously-bypass-approvals-and-sandbox` (or `--full-auto`)
+`auto` runs on **Linux and macOS**. Native **Windows is not supported**
