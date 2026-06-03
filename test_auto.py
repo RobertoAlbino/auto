@@ -163,6 +163,21 @@ class MatchPromptTests(unittest.TestCase):
             auto.match_prompt("1. Yes   2. No", self.claude), auto.ENTER
         )
 
+    def test_claude_boxed_arrow_menu(self):
+        # claude draws confirmations inside a box, so the menu line starts with
+        # the border `│ ` before the arrow. The generic fallback must still
+        # match even when the question text is not a tool-specific phrase.
+        tail = (
+            "│ Save file to disk?        │\n"
+            "│ ❯ 1. Yes                  │\n"
+            "│   2. No                   │"
+        )
+        self.assertEqual(auto.match_prompt(tail, self.claude), auto.ENTER)
+
+    def test_claude_boxed_numbered_menu(self):
+        tail = "│ 1. Yes   │\n│ 2. No    │"
+        self.assertEqual(auto.match_prompt(tail, self.claude), auto.ENTER)
+
     def test_claude_multiline_numbered_menu_without_arrow(self):
         self.assertEqual(
             auto.match_prompt("1. Yes\n2. No", self.claude), auto.ENTER

@@ -42,15 +42,21 @@ if POSIX:
     import termios
     import tty
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 ENTER = b"\r"
 
 # Supported tools. Each one: a list of (prompt regex, key(s) to send).
 # The first rule that matches the visible "tail" of the screen wins.
+#
+# The leading `[ \t│|]*` tolerates a box border before the arrow/number:
+# claude (and others) draw their confirmation menus inside a `│ … │` box, so
+# the menu line reads `│ ❯ 1. Yes` rather than starting with the arrow itself.
+# Without this, the generic fallback never matches a boxed menu and `auto`
+# hangs whenever the question text isn't covered by a tool-specific rule.
 YES_MENU_PATTERNS = [
-    (r"(?m)^\s*[❯›➜→>]\s*(?:\d+[.)]\s*)?Yes\b", ENTER),
-    (r"(?m)^\s*1[.)]\s*Yes\b[\s\S]*\b2[.)]\s*(?:No|Cancel)\b", ENTER),
+    (r"(?m)^[ \t│|]*[❯›➜→>]\s*(?:\d+[.)]\s*)?Yes\b", ENTER),
+    (r"(?m)^[ \t│|]*1[.)]\s*Yes\b[\s\S]*\b2[.)]\s*(?:No|Cancel)\b", ENTER),
 ]
 
 TOOLS = {
