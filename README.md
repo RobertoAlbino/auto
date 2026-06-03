@@ -2,25 +2,23 @@
 
 [![CI](https://github.com/RobertoAlbino/auto/actions/workflows/ci.yml/badge.svg)](https://github.com/RobertoAlbino/auto/actions/workflows/ci.yml)
 
-A wrapper that runs **claude** or **codex** inside a pseudo-terminal (PTY)
-and automatically answers **"yes"** every time the tool pauses to ask for
+A wrapper that runs **claude** or **codex** inside a pseudo-terminal and
+automatically answers **"yes"** every time the tool pauses to ask for
 confirmation.
-
-The only argument is which tool to run (`claude` or `codex`). No other
-options and no alternative command.
 
 ## Installation
 
-No dependencies beyond Python 3 (it uses only the standard library).
-
-Clone the repository and put the script on your PATH:
+Needs only Python 3 — no other dependencies. Clone the repo and run the
+installer for your platform; it puts `auto` on your `PATH`.
 
 ```sh
 git clone https://github.com/RobertoAlbino/auto.git
 cd auto
-chmod +x auto
-ln -s "$PWD/auto" ~/.local/bin/auto   
+./install.sh        # Linux / macOS
+install.bat         # Windows (then open a new terminal)
 ```
+
+Both are safe to re-run. Or skip them and run `python auto claude` directly.
 
 ## Usage
 
@@ -33,4 +31,5 @@ auto update     # self-update (git pull) in the install directory
 
 ## Platform support
 
-`auto` runs on **Linux and macOS**. Native **Windows is not supported**
+auto Works on **Linux**, **macOS**, and **Windows** with no dependencies beyond the
+Python 3 standard library. 

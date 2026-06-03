@@ -20,9 +20,12 @@ import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
 
-import fcntl
-import pty
-import termios
+POSIX = os.name == "posix"
+
+if POSIX:
+    import fcntl
+    import pty
+    import termios
 
 
 def _load_auto():
@@ -183,6 +186,7 @@ class MatchPromptTests(unittest.TestCase):
         self.assertIsNone(auto.match_prompt("Do you want to proceed?", []))
 
 
+@unittest.skipUnless(POSIX, "PTY/termios winsize is POSIX-only")
 class WinsizeTests(unittest.TestCase):
     def _closed_fd(self):
         """Return a file descriptor number that has already been closed."""

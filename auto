@@ -14,24 +14,33 @@ Apart from the `update` subcommand, there are no other options and no
 alternative command: it just launches the chosen tool and auto-accepts the
 confirmation prompts.
 
+Platforms: Linux and macOS use a POSIX PTY (`pty.fork`). Windows uses a
+ConPTY pseudoconsole driven through `ctypes` (no third-party dependency;
+requires Windows 10 1809+). The prompt-detection logic is shared.
+
 SECURITY WARNING: auto-accepting EVERYTHING also bypasses confirmations for
 destructive actions. Prefer running it inside a throwaway directory. See
 README.md.
 """
 
 import errno
-import fcntl
 import os
-import pty
 import re
-import select
-import signal
-import struct
 import subprocess
 import sys
-import termios
 import time
-import tty
+
+POSIX = os.name == "posix"
+WINDOWS = os.name == "nt"
+
+if POSIX:
+    import fcntl
+    import pty
+    import select
+    import signal
+    import struct
+    import termios
+    import tty
 
 ENTER = b"\r"
 
@@ -143,20 +152,8 @@ def set_winsize(fd, rows, cols):
         pass
 
 
-def main(argv=None):
-    if argv is None:
-        argv = sys.argv
-    tool = resolve_tool(argv)
-    if tool == "update":
-        sys.exit(update())
-    if tool not in TOOLS:
-        sys.stderr.write(
-            f"auto: tool {tool!r} is not supported. "
-            f"Use: {' or '.join(sorted(TOOLS))} (or 'update').\n"
-        )
-        sys.exit(2)
-
-    patterns = compile_patterns(tool)
+def _run_posix(tool, patterns):
+    """Run `tool` under a POSIX PTY, auto-answering prompts. Returns an exit code."""
     target = [tool]
 
     stdin_fd = sys.stdin.fileno()
@@ -252,7 +249,363 @@ def main(argv=None):
         except OSError:
             pass
 
-    sys.exit(exit_code)
+    return exit_code
+
+
+# --------------------------------------------------------------------------
+# Windows: ConPTY pseudoconsole, driven through ctypes (no dependencies).
+# Mirrors the POSIX path: write the child's output to the real console, keep a
+# rolling buffer, and after an idle gap inspect the tail and inject keystrokes.
+# Requires Windows 10 1809+ (the first build with the ConPTY API).
+# --------------------------------------------------------------------------
+if WINDOWS:
+    import ctypes
+    import shutil
+    import threading
+    from ctypes import wintypes
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    _STD_INPUT_HANDLE = 0xFFFFFFF6   # (DWORD)-10
+    _STD_OUTPUT_HANDLE = 0xFFFFFFF5  # (DWORD)-11
+    _ENABLE_PROCESSED_INPUT = 0x0001
+    _ENABLE_LINE_INPUT = 0x0002
+    _ENABLE_ECHO_INPUT = 0x0004
+    _ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200
+    _ENABLE_PROCESSED_OUTPUT = 0x0001
+    _ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+    _PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
+    _EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+    _INFINITE = 0xFFFFFFFF
+    _CP_UTF8 = 65001
+
+    class _COORD(ctypes.Structure):
+        _fields_ = [("X", wintypes.SHORT), ("Y", wintypes.SHORT)]
+
+    class _SMALL_RECT(ctypes.Structure):
+        _fields_ = [("Left", wintypes.SHORT), ("Top", wintypes.SHORT),
+                    ("Right", wintypes.SHORT), ("Bottom", wintypes.SHORT)]
+
+    class _CONSOLE_SCREEN_BUFFER_INFO(ctypes.Structure):
+        _fields_ = [("dwSize", _COORD), ("dwCursorPosition", _COORD),
+                    ("wAttributes", wintypes.WORD), ("srWindow", _SMALL_RECT),
+                    ("dwMaximumWindowSize", _COORD)]
+
+    class _STARTUPINFOW(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("lpReserved", wintypes.LPWSTR),
+            ("lpDesktop", wintypes.LPWSTR),
+            ("lpTitle", wintypes.LPWSTR),
+            ("dwX", wintypes.DWORD),
+            ("dwY", wintypes.DWORD),
+            ("dwXSize", wintypes.DWORD),
+            ("dwYSize", wintypes.DWORD),
+            ("dwXCountChars", wintypes.DWORD),
+            ("dwYCountChars", wintypes.DWORD),
+            ("dwFillAttribute", wintypes.DWORD),
+            ("dwFlags", wintypes.DWORD),
+            ("wShowWindow", wintypes.WORD),
+            ("cbReserved2", wintypes.WORD),
+            ("lpReserved2", ctypes.POINTER(ctypes.c_byte)),
+            ("hStdInput", wintypes.HANDLE),
+            ("hStdOutput", wintypes.HANDLE),
+            ("hStdError", wintypes.HANDLE),
+        ]
+
+    class _STARTUPINFOEXW(ctypes.Structure):
+        _fields_ = [("StartupInfo", _STARTUPINFOW),
+                    ("lpAttributeList", ctypes.c_void_p)]
+
+    class _PROCESS_INFORMATION(ctypes.Structure):
+        _fields_ = [("hProcess", wintypes.HANDLE), ("hThread", wintypes.HANDLE),
+                    ("dwProcessId", wintypes.DWORD), ("dwThreadId", wintypes.DWORD)]
+
+    _kernel32.CreatePipe.argtypes = [
+        ctypes.POINTER(wintypes.HANDLE), ctypes.POINTER(wintypes.HANDLE),
+        ctypes.c_void_p, wintypes.DWORD]
+    _kernel32.CreatePipe.restype = wintypes.BOOL
+    _kernel32.ResizePseudoConsole.argtypes = [wintypes.HANDLE, _COORD]
+    _kernel32.ResizePseudoConsole.restype = ctypes.c_long
+    _kernel32.ClosePseudoConsole.argtypes = [wintypes.HANDLE]
+    _kernel32.ClosePseudoConsole.restype = None
+    _kernel32.InitializeProcThreadAttributeList.argtypes = [
+        ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+        ctypes.POINTER(ctypes.c_size_t)]
+    _kernel32.InitializeProcThreadAttributeList.restype = wintypes.BOOL
+    _kernel32.UpdateProcThreadAttribute.argtypes = [
+        ctypes.c_void_p, wintypes.DWORD, ctypes.c_size_t, ctypes.c_void_p,
+        ctypes.c_size_t, ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t)]
+    _kernel32.UpdateProcThreadAttribute.restype = wintypes.BOOL
+    _kernel32.DeleteProcThreadAttributeList.argtypes = [ctypes.c_void_p]
+    _kernel32.DeleteProcThreadAttributeList.restype = None
+    _kernel32.CreateProcessW.argtypes = [
+        wintypes.LPCWSTR, wintypes.LPWSTR, ctypes.c_void_p, ctypes.c_void_p,
+        wintypes.BOOL, wintypes.DWORD, ctypes.c_void_p, wintypes.LPCWSTR,
+        ctypes.c_void_p, ctypes.c_void_p]
+    _kernel32.CreateProcessW.restype = wintypes.BOOL
+    _kernel32.ReadFile.argtypes = [
+        wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    _kernel32.ReadFile.restype = wintypes.BOOL
+    _kernel32.WriteFile.argtypes = [
+        wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    _kernel32.WriteFile.restype = wintypes.BOOL
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+    _kernel32.GetStdHandle.argtypes = [wintypes.DWORD]
+    _kernel32.GetStdHandle.restype = wintypes.HANDLE
+    _kernel32.GetConsoleMode.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    _kernel32.GetConsoleMode.restype = wintypes.BOOL
+    _kernel32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    _kernel32.SetConsoleMode.restype = wintypes.BOOL
+    _kernel32.GetConsoleScreenBufferInfo.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(_CONSOLE_SCREEN_BUFFER_INFO)]
+    _kernel32.GetConsoleScreenBufferInfo.restype = wintypes.BOOL
+    _kernel32.GetConsoleOutputCP.restype = wintypes.UINT
+    _kernel32.GetConsoleCP.restype = wintypes.UINT
+    _kernel32.SetConsoleOutputCP.argtypes = [wintypes.UINT]
+    _kernel32.SetConsoleOutputCP.restype = wintypes.BOOL
+    _kernel32.SetConsoleCP.argtypes = [wintypes.UINT]
+    _kernel32.SetConsoleCP.restype = wintypes.BOOL
+    _kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    _kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    _kernel32.GetExitCodeProcess.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    _kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    # CreatePseudoConsole takes a COORD by value; it is absent on pre-1809
+    # Windows, so resolve it defensively.
+    _create_pseudo_console = getattr(_kernel32, "CreatePseudoConsole", None)
+    if _create_pseudo_console is not None:
+        _create_pseudo_console.argtypes = [
+            _COORD, wintypes.HANDLE, wintypes.HANDLE, wintypes.DWORD,
+            ctypes.POINTER(wintypes.HANDLE)]
+        _create_pseudo_console.restype = ctypes.c_long  # HRESULT
+
+    def _win_winsize(stdout_h):
+        """Return the (rows, cols) of the console window, defaulting to (24, 80)."""
+        info = _CONSOLE_SCREEN_BUFFER_INFO()
+        if _kernel32.GetConsoleScreenBufferInfo(stdout_h, ctypes.byref(info)):
+            cols = info.srWindow.Right - info.srWindow.Left + 1
+            rows = info.srWindow.Bottom - info.srWindow.Top + 1
+            if cols > 0 and rows > 0:
+                return rows, cols
+        return 24, 80
+
+    def _win_command_line(tool):
+        """Resolve `tool` on PATH and build a CreateProcessW command line.
+
+        CreateProcess does not honour PATHEXT or run .cmd/.bat shims directly
+        (npm installs `claude` as a .cmd shim), so resolve with shutil.which
+        and route batch shims through cmd.exe.
+        """
+        exe = shutil.which(tool)
+        if exe is None:
+            return None
+        if exe.lower().endswith((".cmd", ".bat")):
+            return f'cmd.exe /c "{exe}"'
+        return f'"{exe}"'
+
+    def _run_windows(tool, patterns):
+        """Run `tool` under a ConPTY, auto-answering prompts. Returns an exit code."""
+        if _create_pseudo_console is None:
+            sys.stderr.write(
+                "auto: this Windows build lacks ConPTY (needs Windows 10 1809+).\n"
+            )
+            return 1
+
+        cmdline = _win_command_line(tool)
+        if cmdline is None:
+            sys.stderr.write(f"auto: could not run {tool!r}: not found on PATH\n")
+            return 127
+
+        stdin_h = _kernel32.GetStdHandle(_STD_INPUT_HANDLE)
+        stdout_h = _kernel32.GetStdHandle(_STD_OUTPUT_HANDLE)
+        rows, cols = _win_winsize(stdout_h)
+
+        # Two pipes: one feeds keystrokes into the PTY, one carries its output.
+        pty_in_read = wintypes.HANDLE()
+        our_in_write = wintypes.HANDLE()
+        our_out_read = wintypes.HANDLE()
+        pty_out_write = wintypes.HANDLE()
+        if not _kernel32.CreatePipe(
+                ctypes.byref(pty_in_read), ctypes.byref(our_in_write), None, 0):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if not _kernel32.CreatePipe(
+                ctypes.byref(our_out_read), ctypes.byref(pty_out_write), None, 0):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        hpc = wintypes.HANDLE()
+        hr = _create_pseudo_console(
+            _COORD(cols, rows), pty_in_read, pty_out_write, 0, ctypes.byref(hpc))
+        if hr != 0:
+            raise OSError(f"CreatePseudoConsole failed (HRESULT 0x{hr & 0xFFFFFFFF:08x})")
+        # ConPTY duplicated the PTY-side handles; closing our copies lets the
+        # output read return EOF once the child exits.
+        _kernel32.CloseHandle(pty_in_read)
+        _kernel32.CloseHandle(pty_out_write)
+
+        # Attach the pseudoconsole to the child via a process attribute list.
+        attr_size = ctypes.c_size_t(0)
+        _kernel32.InitializeProcThreadAttributeList(
+            None, 1, 0, ctypes.byref(attr_size))
+        attr_buf = (ctypes.c_byte * attr_size.value)()
+        attr_list = ctypes.cast(attr_buf, ctypes.c_void_p)
+        if not _kernel32.InitializeProcThreadAttributeList(
+                attr_list, 1, 0, ctypes.byref(attr_size)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if not _kernel32.UpdateProcThreadAttribute(
+                attr_list, 0, _PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+                hpc, ctypes.sizeof(wintypes.HANDLE), None, None):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+        siex = _STARTUPINFOEXW()
+        siex.StartupInfo.cb = ctypes.sizeof(_STARTUPINFOEXW)
+        siex.lpAttributeList = attr_list
+        pi = _PROCESS_INFORMATION()
+        cmd_buf = ctypes.create_unicode_buffer(cmdline)
+        if not _kernel32.CreateProcessW(
+                None, cmd_buf, None, None, False, _EXTENDED_STARTUPINFO_PRESENT,
+                None, None, ctypes.byref(siex), ctypes.byref(pi)):
+            err = ctypes.get_last_error()
+            _kernel32.ClosePseudoConsole(hpc)
+            _kernel32.DeleteProcThreadAttributeList(attr_list)
+            _kernel32.CloseHandle(our_out_read)
+            _kernel32.CloseHandle(our_in_write)
+            sys.stderr.write(
+                f"auto: could not run {tool!r}: {ctypes.WinError(err)}\n")
+            return 127
+
+        # Put the real console into raw, VT-aware, UTF-8 mode so keystrokes are
+        # forwarded byte-for-byte and the child's VT output renders correctly.
+        old_in_mode = wintypes.DWORD()
+        old_out_mode = wintypes.DWORD()
+        have_in = bool(_kernel32.GetConsoleMode(stdin_h, ctypes.byref(old_in_mode)))
+        have_out = bool(_kernel32.GetConsoleMode(stdout_h, ctypes.byref(old_out_mode)))
+        old_out_cp = _kernel32.GetConsoleOutputCP()
+        old_in_cp = _kernel32.GetConsoleCP()
+        if have_in:
+            new_in = (old_in_mode.value
+                      & ~_ENABLE_LINE_INPUT
+                      & ~_ENABLE_ECHO_INPUT
+                      & ~_ENABLE_PROCESSED_INPUT) | _ENABLE_VIRTUAL_TERMINAL_INPUT
+            _kernel32.SetConsoleMode(stdin_h, new_in)
+        if have_out:
+            _kernel32.SetConsoleMode(
+                stdout_h, old_out_mode.value
+                | _ENABLE_PROCESSED_OUTPUT | _ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+        _kernel32.SetConsoleOutputCP(_CP_UTF8)
+        _kernel32.SetConsoleCP(_CP_UTF8)
+
+        lock = threading.Lock()
+        done = threading.Event()
+        state = {"buffer": bytearray(), "last_output": time.monotonic(),
+                 "pending": False, "last_answered": None}
+
+        def _pump_output():
+            buf = (ctypes.c_char * 4096)()
+            nread = wintypes.DWORD(0)
+            wn = wintypes.DWORD(0)
+            while True:
+                ok = _kernel32.ReadFile(
+                    our_out_read, buf, 4096, ctypes.byref(nread), None)
+                if not ok or nread.value == 0:
+                    break  # PTY closed its output -> the child exited
+                data = bytes(buf[:nread.value])
+                _kernel32.WriteFile(stdout_h, data, len(data), ctypes.byref(wn), None)
+                with lock:
+                    state["buffer"].extend(data)
+                    if len(state["buffer"]) > BUFFER_LIMIT:
+                        del state["buffer"][:-BUFFER_LIMIT]
+                    state["last_output"] = time.monotonic()
+                    state["pending"] = True
+            done.set()
+
+        def _pump_input():
+            buf = (ctypes.c_char * 4096)()
+            nread = wintypes.DWORD(0)
+            wn = wintypes.DWORD(0)
+            while not done.is_set():
+                ok = _kernel32.ReadFile(
+                    stdin_h, buf, 4096, ctypes.byref(nread), None)
+                if not ok or nread.value == 0:
+                    break
+                data = bytes(buf[:nread.value])
+                _kernel32.WriteFile(
+                    our_in_write, data, len(data), ctypes.byref(wn), None)
+                # the user interacted: don't fight them on the current prompt
+                with lock:
+                    state["last_answered"] = None
+
+        threading.Thread(target=_pump_output, daemon=True).start()
+        threading.Thread(target=_pump_input, daemon=True).start()
+
+        last_size = (rows, cols)
+        exit_code = 0
+        wn = wintypes.DWORD(0)
+        try:
+            while not done.is_set():
+                done.wait(0.05)
+                now = time.monotonic()
+                tail = None
+                last = None
+                with lock:
+                    if state["pending"] and (now - state["last_output"]) >= IDLE_SECS:
+                        state["pending"] = False
+                        tail = visible_tail(bytes(state["buffer"]))
+                        last = state["last_answered"]
+                if tail is not None:
+                    keys = match_prompt(tail, patterns)
+                    if keys is not None and tail != last:
+                        _kernel32.WriteFile(
+                            our_in_write, keys, len(keys), ctypes.byref(wn), None)
+                        with lock:
+                            state["last_answered"] = tail
+                # propagate console resizes (Windows has no SIGWINCH)
+                r, c = _win_winsize(stdout_h)
+                if (r, c) != last_size:
+                    last_size = (r, c)
+                    _kernel32.ResizePseudoConsole(hpc, _COORD(c, r))
+        finally:
+            _kernel32.WaitForSingleObject(pi.hProcess, _INFINITE)
+            code = wintypes.DWORD(0)
+            if _kernel32.GetExitCodeProcess(pi.hProcess, ctypes.byref(code)):
+                exit_code = code.value
+            _kernel32.ClosePseudoConsole(hpc)
+            _kernel32.DeleteProcThreadAttributeList(attr_list)
+            _kernel32.CloseHandle(our_out_read)
+            _kernel32.CloseHandle(our_in_write)
+            _kernel32.CloseHandle(pi.hThread)
+            _kernel32.CloseHandle(pi.hProcess)
+            if have_in:
+                _kernel32.SetConsoleMode(stdin_h, old_in_mode.value)
+            if have_out:
+                _kernel32.SetConsoleMode(stdout_h, old_out_mode.value)
+            _kernel32.SetConsoleOutputCP(old_out_cp)
+            _kernel32.SetConsoleCP(old_in_cp)
+
+        return exit_code
+
+
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv
+    tool = resolve_tool(argv)
+    if tool == "update":
+        sys.exit(update())
+    if tool not in TOOLS:
+        sys.stderr.write(
+            f"auto: tool {tool!r} is not supported. "
+            f"Use: {' or '.join(sorted(TOOLS))} (or 'update').\n"
+        )
+        sys.exit(2)
+
+    patterns = compile_patterns(tool)
+    if WINDOWS:
+        sys.exit(_run_windows(tool, patterns))
+    sys.exit(_run_posix(tool, patterns))
 
 
 if __name__ == "__main__":
