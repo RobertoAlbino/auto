@@ -15,7 +15,7 @@ installer for your platform.
 git clone https://github.com/RobertoAlbino/auto.git
 cd auto
 ./install.sh        # Linux / macOS
-install.bat         # Windows (then open a new terminal)
+./install.bat       # Windows
 ```
 
 ## Usage
