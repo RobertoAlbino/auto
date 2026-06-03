@@ -46,17 +46,21 @@ ENTER = b"\r"
 
 # Supported tools. Each one: a list of (prompt regex, key(s) to send).
 # The first rule that matches the visible "tail" of the screen wins.
+YES_MENU_PATTERNS = [
+    (r"(?m)^\s*[❯›➜→>]\s*(?:\d+[.)]\s*)?Yes\b", ENTER),
+    (r"(?m)^\s*1[.)]\s*Yes\b[\s\S]*\b2[.)]\s*(?:No|Cancel)\b", ENTER),
+]
+
 TOOLS = {
     "claude": [
         (r"Do you want to (proceed|make this edit|create|run)", ENTER),
-        (r"❯\s*1\.\s*Yes", ENTER),
-        (r"\b1\.\s*Yes\b.*\b2\.\s*", ENTER),
+        *YES_MENU_PATTERNS,
     ],
     "codex": [
         (r"Allow.*\?", ENTER),
         (r"Approve", ENTER),
-        (r"❯\s*1\.\s*Yes", ENTER),
-        (r"\(y/n\)", b"y\r"),
+        *YES_MENU_PATTERNS,
+        (r"[\[(]\s*y\s*/\s*n\s*[\])]", b"y\r"),
     ],
 }
 

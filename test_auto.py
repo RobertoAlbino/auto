@@ -153,9 +153,19 @@ class MatchPromptTests(unittest.TestCase):
             auto.match_prompt("❯ 1. Yes\n  2. No", self.claude), auto.ENTER
         )
 
+    def test_claude_arrow_menu_without_number(self):
+        self.assertEqual(
+            auto.match_prompt("❯ Yes\n  No", self.claude), auto.ENTER
+        )
+
     def test_claude_numbered_menu_without_arrow(self):
         self.assertEqual(
             auto.match_prompt("1. Yes   2. No", self.claude), auto.ENTER
+        )
+
+    def test_claude_multiline_numbered_menu_without_arrow(self):
+        self.assertEqual(
+            auto.match_prompt("1. Yes\n2. No", self.claude), auto.ENTER
         )
 
     def test_codex_allow_question(self):
@@ -168,8 +178,21 @@ class MatchPromptTests(unittest.TestCase):
             auto.match_prompt("Approve changes", self.codex), auto.ENTER
         )
 
+    def test_codex_arrow_menu_without_number(self):
+        self.assertEqual(
+            auto.match_prompt("› Yes\n  No", self.codex), auto.ENTER
+        )
+
+    def test_codex_multiline_numbered_menu_without_arrow(self):
+        self.assertEqual(
+            auto.match_prompt("1. Yes\n2. No", self.codex), auto.ENTER
+        )
+
     def test_codex_yn_sends_y_enter(self):
         self.assertEqual(auto.match_prompt("continue? (y/n)", self.codex), b"y\r")
+
+    def test_codex_bracketed_yn_sends_y_enter(self):
+        self.assertEqual(auto.match_prompt("continue? [y/N]", self.codex), b"y\r")
 
     def test_match_is_case_insensitive(self):
         self.assertEqual(
