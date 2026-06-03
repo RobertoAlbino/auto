@@ -8,8 +8,8 @@ confirmation.
 
 ## Installation
 
-Needs only Python 3 — no other dependencies. Clone the repo and run the
-installer for your platform; it puts `auto` on your `PATH`.
+Needs only Python 3. Clone the repo and run the
+installer for your platform.
 
 ```sh
 git clone https://github.com/RobertoAlbino/auto.git
@@ -17,8 +17,6 @@ cd auto
 ./install.sh        # Linux / macOS
 install.bat         # Windows (then open a new terminal)
 ```
-
-Both are safe to re-run. Or skip them and run `python auto claude` directly.
 
 ## Usage
 
@@ -31,5 +29,4 @@ auto update     # self-update (git pull) in the install directory
 
 ## Platform support
 
-auto Works on **Linux**, **macOS**, and **Windows** with no dependencies beyond the
-Python 3 standard library. 
+auto Works on **Linux**, **macOS**, and **Windows**
