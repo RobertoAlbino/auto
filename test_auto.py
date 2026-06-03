@@ -313,9 +313,53 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(captured["cmd"], ["git", "-C", tmp, "pull", "--ff-only"])
 
 
+class BumpVersionTests(unittest.TestCase):
+    def test_bumps_patch_by_default(self):
+        self.assertEqual(auto.bump_version("1.2.3"), "1.2.4")
+
+    def test_bumps_minor_and_resets_patch(self):
+        self.assertEqual(auto.bump_version("1.2.3", "minor"), "1.3.0")
+
+    def test_bumps_major_and_resets_minor_and_patch(self):
+        self.assertEqual(auto.bump_version("1.2.3", "major"), "2.0.0")
+
+    def test_unknown_part_raises_valueerror(self):
+        with self.assertRaises(ValueError):
+            auto.bump_version("1.2.3", "nope")
+
+
+class BumpSourceTests(unittest.TestCase):
+    def _write(self, tmp, body):
+        path = os.path.join(tmp, "auto")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(body)
+        return path
+
+    def test_increments_version_in_file_and_returns_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, 'x = 1\n__version__ = "0.4.9"\ny = 2\n')
+            self.assertEqual(auto.bump_source(path), "0.4.10")
+            with open(path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), 'x = 1\n__version__ = "0.4.10"\ny = 2\n')
+
+    def test_honours_part_argument(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, '__version__ = "1.0.0"\n')
+            self.assertEqual(auto.bump_source(path, "major"), "2.0.0")
+
+    def test_missing_version_raises_valueerror(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, "no version here\n")
+            with self.assertRaises(ValueError):
+                auto.bump_source(path)
+
+
 class ConstantsTests(unittest.TestCase):
     def test_enter_is_carriage_return(self):
         self.assertEqual(auto.ENTER, b"\r")
+
+    def test_version_is_a_semver_string(self):
+        self.assertRegex(auto.__version__, r"^\d+\.\d+\.\d+$")
 
     def test_known_tools(self):
         self.assertEqual(set(auto.TOOLS), {"claude", "codex"})

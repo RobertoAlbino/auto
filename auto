@@ -42,6 +42,8 @@ if POSIX:
     import termios
     import tty
 
+__version__ = "0.1.1"
+
 ENTER = b"\r"
 
 # Supported tools. Each one: a list of (prompt regex, key(s) to send).
@@ -136,6 +138,45 @@ def update(repo=None, runner=subprocess.call):
         )
         return 1
     return runner(["git", "-C", repo, "pull", "--ff-only"])
+
+
+# Matches the `__version__ = "X.Y.Z"` assignment so the version can be bumped
+# in place (used by the pre-commit hook) without touching the rest of the file.
+VERSION_RE = re.compile(r'(?m)^__version__\s*=\s*"(?P<v>\d+\.\d+\.\d+)"')
+
+
+def bump_version(version, part="patch"):
+    """Return `version` (a "MAJOR.MINOR.PATCH" string) with `part` incremented.
+
+    Bumping major resets minor and patch to 0; bumping minor resets patch.
+    """
+    major, minor, patch = (int(n) for n in version.split("."))
+    if part == "major":
+        return f"{major + 1}.0.0"
+    if part == "minor":
+        return f"{major}.{minor + 1}.0"
+    if part == "patch":
+        return f"{major}.{minor}.{patch + 1}"
+    raise ValueError(f"unknown version part: {part!r}")
+
+
+def bump_source(path=None, part="patch"):
+    """Increment the `__version__` string inside the `auto` source file.
+
+    `path` defaults to this script. Returns the new version. Raises ValueError
+    if no `__version__` assignment is found.
+    """
+    path = path if path is not None else os.path.realpath(__file__)
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    match = VERSION_RE.search(text)
+    if match is None:
+        raise ValueError(f"no __version__ string found in {path!r}")
+    new_version = bump_version(match.group("v"), part)
+    new_text = text[: match.start("v")] + new_version + text[match.end("v") :]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(new_text)
+    return new_version
 
 
 def get_winsize(fd):
@@ -597,6 +638,9 @@ def main(argv=None):
     if argv is None:
         argv = sys.argv
     tool = resolve_tool(argv)
+    if tool in ("--version", "-V", "version"):
+        sys.stdout.write(f"auto {__version__}\n")
+        sys.exit(0)
     if tool == "update":
         sys.exit(update())
     if tool not in TOOLS:
@@ -606,6 +650,8 @@ def main(argv=None):
         )
         sys.exit(2)
 
+    # Announce the running version before handing the terminal to the tool.
+    sys.stderr.write(f"auto {__version__}\n")
     patterns = compile_patterns(tool)
     if WINDOWS:
         sys.exit(_run_windows(tool, patterns))

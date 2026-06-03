@@ -29,6 +29,13 @@ mkdir -p "$BINDIR"
 ln -sf "$SRC" "$DEST"
 echo "install: linked $DEST -> $SRC"
 
+# In a git checkout, enable the version-bumping pre-commit hook for contributors.
+if [ -d "$REPO/.git" ] && [ -d "$REPO/.githooks" ]; then
+    git -C "$REPO" config core.hooksPath .githooks
+    chmod +x "$REPO/.githooks/pre-commit"
+    echo "install: enabled pre-commit version bump (core.hooksPath=.githooks)"
+fi
+
 # Warn (don't fail) if the install directory is not on PATH yet.
 case ":$PATH:" in
     *":$BINDIR:"*)

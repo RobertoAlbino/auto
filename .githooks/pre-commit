@@ -1,0 +1,21 @@
+#!/bin/sh
+# pre-commit — bump auto's patch version on every commit.
+#
+# Reuses bump_source() from the `auto` script itself (single source of truth
+# for the version format), then re-stages `auto` so the bump lands in the
+# commit. Enable with:  git config core.hooksPath .githooks
+# (install.sh does this automatically.)
+set -eu
+
+REPO="$(git rev-parse --show-toplevel)"
+
+python3 - "$REPO/auto" <<'PY' || exit 1
+import sys
+from importlib.machinery import SourceFileLoader
+
+path = sys.argv[1]
+auto = SourceFileLoader("auto", path).load_module()
+print(f"pre-commit: auto -> {auto.bump_source(path)}")
+PY
+
+git add "$REPO/auto"
