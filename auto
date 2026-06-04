@@ -42,7 +42,7 @@ if POSIX:
     import termios
     import tty
 
-__version__ = "0.1.2"
+__version__ = "0.1.4"
 
 ENTER = b"\r"
 
@@ -78,6 +78,13 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[\(\)][AB012]|\x1b[=>]|\r")
 BUFFER_LIMIT = 8192          # raw bytes kept for detection
 TAIL_LINES = 12              # how many visible lines to inspect when matching
 IDLE_SECS = 0.4              # output inactivity before checking for a prompt
+# If a prompt we already answered is still on screen this long after, with no
+# output drawn since, the keystroke was almost certainly dropped while the TUI
+# was redrawing -- re-send the answer instead of waiting forever.
+ANSWER_RETRY_SECS = 1.5
+# Bounded re-sends, so a genuinely stuck prompt does not turn into an endless
+# stream of keystrokes injected into the tool.
+MAX_ANSWER_RETRIES = 2
 
 
 def resolve_tool(argv):
@@ -119,6 +126,80 @@ def match_prompt(tail, patterns):
         if rx.search(tail):
             return keys
     return None
+
+
+class Answerer:
+    """Decides what (if anything) to send to an auto-answered tool.
+
+    This is the shared, side-effect-free brain used by both the POSIX and the
+    Windows event loops. It keeps just enough state to:
+
+    * avoid re-answering the same unchanged screen on every frame, and
+    * re-send the answer a bounded number of times if it never took effect.
+
+    The second point fixes the hang the wrapper used to suffer: the tool's TUI
+    occasionally drops a keystroke that arrives while it is repainting, which
+    left `auto` blocked forever waiting for output that would never come. When
+    the prompt we answered is still on screen and *nothing* has been drawn
+    since, we assume the keystroke was lost and send it again.
+    """
+
+    def __init__(self, patterns, retry_secs=ANSWER_RETRY_SECS,
+                 max_retries=MAX_ANSWER_RETRIES):
+        self.patterns = patterns
+        self.retry_secs = retry_secs
+        self.max_retries = max_retries
+        self.answered_tail = None     # the exact screen we last answered
+        self.answered_keys = None     # the keys we sent for it (for re-sends)
+        self.answered_at = 0.0        # when we last sent them (monotonic)
+        self.retries = 0              # re-sends issued for answered_tail
+
+    def reset(self):
+        """Forget the last answer; call when the user takes over a prompt."""
+        self.answered_tail = None
+        self.retries = 0
+
+    def on_idle(self, tail, now):
+        """Inspect a settled screen; return keys to send, or None.
+
+        Answers a freshly-appeared prompt once. Returns None when there is no
+        prompt or when this exact screen was already answered.
+        """
+        keys = match_prompt(tail, self.patterns)
+        if keys is None:
+            self.reset()                       # no prompt on screen anymore
+            return None
+        if tail == self.answered_tail:
+            return None                        # already answered this screen
+        self.answered_tail = tail
+        self.answered_keys = keys
+        self.answered_at = now
+        self.retries = 0
+        return keys
+
+    def retry_pending(self):
+        """Whether a watchdog re-send may still be due (gates the loop wait)."""
+        return self.answered_tail is not None and self.retries < self.max_retries
+
+    def on_timeout(self, tail, now, output_since_answer):
+        """Re-send the answer if it evidently never took effect, else None.
+
+        Only fires when the answered prompt is still on screen unchanged and no
+        output has been drawn since we answered -- the signature of a dropped
+        keystroke. `output_since_answer` is True if the tool produced any bytes
+        after our last send (in which case the answer clearly registered).
+        """
+        if not self.retry_pending():
+            return None
+        if output_since_answer or (now - self.answered_at) < self.retry_secs:
+            return None
+        if match_prompt(tail, self.patterns) is not None \
+                and tail == self.answered_tail:
+            self.answered_at = now
+            self.retries += 1
+            return self.answered_keys
+        self.reset()                           # screen changed: answer landed
+        return None
 
 
 def install_dir(path=None):
@@ -238,12 +319,19 @@ def _run_posix(tool, patterns):
     raw_buffer = bytearray()
     last_output = time.monotonic()
     pending_check = False           # there is new output not yet analyzed
-    last_answered_tail = None       # avoid answering the same screen repeatedly
+    answerer = Answerer(patterns)   # decides what to send (and when to re-send)
     exit_code = 0
 
     try:
         while True:
-            timeout = IDLE_SECS if pending_check else None
+            # Wait for IO, but also wake up periodically so the watchdog can
+            # re-send an answer that produced no output (a dropped keystroke).
+            if pending_check:
+                timeout = IDLE_SECS
+            elif answerer.retry_pending():
+                timeout = ANSWER_RETRY_SECS
+            else:
+                timeout = None
             try:
                 rlist, _, _ = select.select([stdin_fd, master_fd], [], [], timeout)
             except select.error as e:
@@ -273,16 +361,23 @@ def _run_posix(tool, patterns):
                 if user_in:
                     os.write(master_fd, user_in)
                     # the user interacted: don't fight them on the current prompt
-                    last_answered_tail = None
+                    answerer.reset()
 
-            # check for a prompt after an idle period
-            if pending_check and (time.monotonic() - last_output) >= IDLE_SECS:
+            now = time.monotonic()
+            if pending_check and (now - last_output) >= IDLE_SECS:
+                # The screen settled: answer a freshly-appeared prompt.
                 pending_check = False
-                tail = visible_tail(bytes(raw_buffer))
-                keys = match_prompt(tail, patterns)
-                if keys is not None and tail != last_answered_tail:
+                keys = answerer.on_idle(visible_tail(bytes(raw_buffer)), now)
+                if keys is not None:
                     os.write(master_fd, keys)
-                    last_answered_tail = tail
+            elif answerer.retry_pending():
+                # No output since we answered: the keystroke may have been
+                # dropped mid-redraw. Re-send if the prompt is still up.
+                keys = answerer.on_timeout(
+                    visible_tail(bytes(raw_buffer)), now,
+                    output_since_answer=last_output > answerer.answered_at)
+                if keys is not None:
+                    os.write(master_fd, keys)
     finally:
         if old_term is not None:
             termios.tcsetattr(stdin_fd, termios.TCSAFLUSH, old_term)
@@ -553,7 +648,8 @@ if WINDOWS:
         lock = threading.Lock()
         done = threading.Event()
         state = {"buffer": bytearray(), "last_output": time.monotonic(),
-                 "pending": False, "last_answered": None}
+                 "pending": False, "user_typed": False}
+        answerer = Answerer(patterns)
 
         def _pump_output():
             buf = (ctypes.c_char * 4096)()
@@ -588,7 +684,7 @@ if WINDOWS:
                     our_in_write, data, len(data), ctypes.byref(wn), None)
                 # the user interacted: don't fight them on the current prompt
                 with lock:
-                    state["last_answered"] = None
+                    state["user_typed"] = True
 
         threading.Thread(target=_pump_output, daemon=True).start()
         threading.Thread(target=_pump_input, daemon=True).start()
@@ -601,19 +697,31 @@ if WINDOWS:
                 done.wait(0.05)
                 now = time.monotonic()
                 tail = None
-                last = None
+                idle = False
+                out_since = False
                 with lock:
-                    if state["pending"] and (now - state["last_output"]) >= IDLE_SECS:
+                    user_typed = state["user_typed"]
+                    state["user_typed"] = False
+                    idle = (state["pending"]
+                            and (now - state["last_output"]) >= IDLE_SECS)
+                    if idle:
                         state["pending"] = False
+                    if idle or answerer.retry_pending():
                         tail = visible_tail(bytes(state["buffer"]))
-                        last = state["last_answered"]
-                if tail is not None:
-                    keys = match_prompt(tail, patterns)
-                    if keys is not None and tail != last:
-                        _kernel32.WriteFile(
-                            our_in_write, keys, len(keys), ctypes.byref(wn), None)
-                        with lock:
-                            state["last_answered"] = tail
+                        out_since = state["last_output"] > answerer.answered_at
+                if user_typed:
+                    answerer.reset()
+                keys = None
+                if idle and tail is not None:
+                    # The screen settled: answer a freshly-appeared prompt.
+                    keys = answerer.on_idle(tail, now)
+                elif tail is not None and answerer.retry_pending():
+                    # No output since we answered: re-send if still on screen.
+                    keys = answerer.on_timeout(
+                        tail, now, output_since_answer=out_since)
+                if keys is not None:
+                    _kernel32.WriteFile(
+                        our_in_write, keys, len(keys), ctypes.byref(wn), None)
                 # propagate console resizes (Windows has no SIGWINCH)
                 r, c = _win_winsize(stdout_h)
                 if (r, c) != last_size:

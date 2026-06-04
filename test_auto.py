@@ -224,6 +224,91 @@ class MatchPromptTests(unittest.TestCase):
         self.assertIsNone(auto.match_prompt("Do you want to proceed?", []))
 
 
+class AnswererTests(unittest.TestCase):
+    """The state machine that decides what to send and when to re-send."""
+
+    def setUp(self):
+        self.patterns = auto.compile_patterns("claude")
+        # Small, explicit retry window so the tests can drive time by hand.
+        self.a = auto.Answerer(self.patterns, retry_secs=1.0, max_retries=2)
+        self.prompt = "Do you want to proceed?"
+
+    def test_on_idle_answers_a_fresh_prompt(self):
+        self.assertEqual(self.a.on_idle(self.prompt, now=0.0), auto.ENTER)
+
+    def test_on_idle_returns_none_when_no_prompt(self):
+        self.assertIsNone(self.a.on_idle("just some output", now=0.0))
+
+    def test_on_idle_does_not_reanswer_the_same_screen(self):
+        self.assertEqual(self.a.on_idle(self.prompt, now=0.0), auto.ENTER)
+        self.assertIsNone(self.a.on_idle(self.prompt, now=0.1))
+
+    def test_on_idle_answers_a_different_prompt(self):
+        self.a.on_idle("Do you want to make this edit?", now=0.0)
+        # A genuinely different screen is a new prompt and gets answered.
+        self.assertEqual(self.a.on_idle(self.prompt, now=0.5), auto.ENTER)
+
+    def test_retry_pending_tracks_outstanding_answer(self):
+        self.assertFalse(self.a.retry_pending())
+        self.a.on_idle(self.prompt, now=0.0)
+        self.assertTrue(self.a.retry_pending())
+        # A screen with no prompt clears the outstanding state.
+        self.a.on_idle("done", now=0.1)
+        self.assertFalse(self.a.retry_pending())
+
+    def test_on_timeout_resends_when_answer_produced_no_output(self):
+        self.a.on_idle(self.prompt, now=0.0)
+        # Same screen, nothing drawn since, past the retry window: re-send.
+        self.assertEqual(
+            self.a.on_timeout(self.prompt, now=1.5, output_since_answer=False),
+            auto.ENTER,
+        )
+
+    def test_on_timeout_does_not_resend_before_window(self):
+        self.a.on_idle(self.prompt, now=0.0)
+        self.assertIsNone(
+            self.a.on_timeout(self.prompt, now=0.5, output_since_answer=False)
+        )
+
+    def test_on_timeout_does_not_resend_when_output_arrived(self):
+        self.a.on_idle(self.prompt, now=0.0)
+        # Output since the answer means it registered; never re-send.
+        self.assertIsNone(
+            self.a.on_timeout(self.prompt, now=1.5, output_since_answer=True)
+        )
+
+    def test_on_timeout_stops_after_max_retries(self):
+        self.a.on_idle(self.prompt, now=0.0)
+        self.assertEqual(
+            self.a.on_timeout(self.prompt, now=1.5, output_since_answer=False),
+            auto.ENTER,
+        )
+        self.assertEqual(
+            self.a.on_timeout(self.prompt, now=3.0, output_since_answer=False),
+            auto.ENTER,
+        )
+        # Two re-sends is the cap; further timeouts inject nothing.
+        self.assertFalse(self.a.retry_pending())
+        self.assertIsNone(
+            self.a.on_timeout(self.prompt, now=4.5, output_since_answer=False)
+        )
+
+    def test_on_timeout_clears_state_when_screen_changed(self):
+        self.a.on_idle(self.prompt, now=0.0)
+        # The prompt is gone (answer landed): nothing to re-send, state clears.
+        self.assertIsNone(
+            self.a.on_timeout("command output", now=1.5, output_since_answer=False)
+        )
+        self.assertFalse(self.a.retry_pending())
+
+    def test_reset_forgets_the_outstanding_answer(self):
+        self.a.on_idle(self.prompt, now=0.0)
+        self.a.reset()
+        self.assertFalse(self.a.retry_pending())
+        # After a reset the same screen is treated as fresh again.
+        self.assertEqual(self.a.on_idle(self.prompt, now=0.1), auto.ENTER)
+
+
 @unittest.skipUnless(POSIX, "PTY/termios winsize is POSIX-only")
 class WinsizeTests(unittest.TestCase):
     def _closed_fd(self):
