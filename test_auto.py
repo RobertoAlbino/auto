@@ -223,90 +223,112 @@ class MatchPromptTests(unittest.TestCase):
     def test_empty_patterns_returns_none(self):
         self.assertIsNone(auto.match_prompt("Do you want to proceed?", []))
 
+    def test_ex_returns_keys_and_matched_text(self):
+        keys, sig = auto.match_prompt_ex("Do you want to proceed?", self.claude)
+        self.assertEqual(keys, auto.ENTER)
+        self.assertEqual(sig, "Do you want to proceed")
+
+    def test_ex_returns_none_without_a_match(self):
+        self.assertIsNone(auto.match_prompt_ex("nothing here", self.claude))
+
+    def test_ex_signature_ignores_surrounding_noise(self):
+        # The matched text is the same whether or not a spinner line follows,
+        # so it is a stable identity for the prompt across repaints.
+        a = auto.match_prompt_ex("❯ 1. Yes\n  2. No", self.claude)
+        b = auto.match_prompt_ex("❯ 1. Yes\n  2. No\n  / working", self.claude)
+        self.assertEqual(a[1], b[1])
+
 
 class AnswererTests(unittest.TestCase):
     """The state machine that decides what to send and when to re-send."""
 
     def setUp(self):
         self.patterns = auto.compile_patterns("claude")
-        # Small, explicit retry window so the tests can drive time by hand.
-        self.a = auto.Answerer(self.patterns, retry_secs=1.0, max_retries=2)
+        # Small, explicit windows so the tests can drive time by hand.
+        self.a = auto.Answerer(
+            self.patterns, stable_secs=0.4, retry_secs=1.0, max_retries=2
+        )
         self.prompt = "Do you want to proceed?"
 
-    def test_on_idle_answers_a_fresh_prompt(self):
-        self.assertEqual(self.a.on_idle(self.prompt, now=0.0), auto.ENTER)
+    def _answer(self, tail, t0=0.0):
+        """Drive a prompt from first sighting to its answer; return the keys."""
+        self.assertIsNone(self.a.consider(tail, now=t0))     # starts the window
+        return self.a.consider(tail, now=t0 + self.a.stable_secs)
 
-    def test_on_idle_returns_none_when_no_prompt(self):
-        self.assertIsNone(self.a.on_idle("just some output", now=0.0))
+    def test_answers_once_prompt_is_stable(self):
+        # First sighting only starts the stability window; the answer comes
+        # once the prompt has stayed up for stable_secs.
+        self.assertIsNone(self.a.consider(self.prompt, now=0.0))
+        self.assertIsNone(self.a.consider(self.prompt, now=0.3))
+        self.assertEqual(self.a.consider(self.prompt, now=0.4), auto.ENTER)
 
-    def test_on_idle_does_not_reanswer_the_same_screen(self):
-        self.assertEqual(self.a.on_idle(self.prompt, now=0.0), auto.ENTER)
-        self.assertIsNone(self.a.on_idle(self.prompt, now=0.1))
+    def test_returns_none_when_no_prompt(self):
+        self.assertIsNone(self.a.consider("just some output", now=0.0))
 
-    def test_on_idle_answers_a_different_prompt(self):
-        self.a.on_idle("Do you want to make this edit?", now=0.0)
-        # A genuinely different screen is a new prompt and gets answered.
-        self.assertEqual(self.a.on_idle(self.prompt, now=0.5), auto.ENTER)
+    def test_does_not_reanswer_the_same_prompt(self):
+        self.assertEqual(self._answer(self.prompt), auto.ENTER)
+        self.assertIsNone(self.a.consider(self.prompt, now=0.5))
 
-    def test_retry_pending_tracks_outstanding_answer(self):
-        self.assertFalse(self.a.retry_pending())
-        self.a.on_idle(self.prompt, now=0.0)
-        self.assertTrue(self.a.retry_pending())
-        # A screen with no prompt clears the outstanding state.
-        self.a.on_idle("done", now=0.1)
-        self.assertFalse(self.a.retry_pending())
+    def test_answers_through_a_churning_spinner(self):
+        # The menu holds still while a spinner line below it animates every
+        # frame: the screen never goes quiet, but the matched prompt text does
+        # not change, so the prompt is still answered exactly once.
+        frames = [
+            "Do you want to proceed?\n❯ 1. Yes\n  2. No\n  {} working".format(c)
+            for c in "|/-\\|/-\\"
+        ]
+        answers = []
+        for i, frame in enumerate(frames):
+            keys = self.a.consider(frame, now=i * 0.15)
+            if keys is not None:
+                answers.append(keys)
+        self.assertEqual(answers, [auto.ENTER])
 
-    def test_on_timeout_resends_when_answer_produced_no_output(self):
-        self.a.on_idle(self.prompt, now=0.0)
-        # Same screen, nothing drawn since, past the retry window: re-send.
-        self.assertEqual(
-            self.a.on_timeout(self.prompt, now=1.5, output_since_answer=False),
-            auto.ENTER,
-        )
+    def test_answers_a_different_prompt_after_the_first(self):
+        self.assertEqual(self._answer("Do you want to make this edit?"), auto.ENTER)
+        # A genuinely different prompt restarts the window and is answered.
+        self.assertIsNone(self.a.consider(self.prompt, now=2.0))
+        self.assertEqual(self.a.consider(self.prompt, now=2.5), auto.ENTER)
 
-    def test_on_timeout_does_not_resend_before_window(self):
-        self.a.on_idle(self.prompt, now=0.0)
-        self.assertIsNone(
-            self.a.on_timeout(self.prompt, now=0.5, output_since_answer=False)
-        )
+    def test_needs_tick_tracks_outstanding_work(self):
+        self.assertFalse(self.a.needs_tick())
+        self.a.consider(self.prompt, now=0.0)
+        # A tracked-but-unanswered prompt needs ticking to close its window.
+        self.assertTrue(self.a.needs_tick())
+        # A screen with no prompt clears the state.
+        self.a.consider("done", now=0.1)
+        self.assertFalse(self.a.needs_tick())
 
-    def test_on_timeout_does_not_resend_when_output_arrived(self):
-        self.a.on_idle(self.prompt, now=0.0)
-        # Output since the answer means it registered; never re-send.
-        self.assertIsNone(
-            self.a.on_timeout(self.prompt, now=1.5, output_since_answer=True)
-        )
+    def test_resends_when_prompt_lingers_after_answering(self):
+        self.assertEqual(self._answer(self.prompt), auto.ENTER)
+        # Still on screen well past the retry window: the keystroke was likely
+        # dropped mid-redraw, so re-send.
+        self.assertEqual(self.a.consider(self.prompt, now=1.5), auto.ENTER)
 
-    def test_on_timeout_stops_after_max_retries(self):
-        self.a.on_idle(self.prompt, now=0.0)
-        self.assertEqual(
-            self.a.on_timeout(self.prompt, now=1.5, output_since_answer=False),
-            auto.ENTER,
-        )
-        self.assertEqual(
-            self.a.on_timeout(self.prompt, now=3.0, output_since_answer=False),
-            auto.ENTER,
-        )
-        # Two re-sends is the cap; further timeouts inject nothing.
-        self.assertFalse(self.a.retry_pending())
-        self.assertIsNone(
-            self.a.on_timeout(self.prompt, now=4.5, output_since_answer=False)
-        )
+    def test_does_not_resend_before_retry_window(self):
+        self.assertEqual(self._answer(self.prompt), auto.ENTER)
+        self.assertIsNone(self.a.consider(self.prompt, now=0.9))
 
-    def test_on_timeout_clears_state_when_screen_changed(self):
-        self.a.on_idle(self.prompt, now=0.0)
+    def test_resend_stops_after_max_retries(self):
+        self.assertEqual(self._answer(self.prompt), auto.ENTER)
+        self.assertEqual(self.a.consider(self.prompt, now=1.5), auto.ENTER)
+        self.assertEqual(self.a.consider(self.prompt, now=2.6), auto.ENTER)
+        # Two re-sends is the cap; a genuinely stuck prompt is left alone.
+        self.assertFalse(self.a.needs_tick())
+        self.assertIsNone(self.a.consider(self.prompt, now=3.7))
+
+    def test_clears_state_when_prompt_disappears(self):
+        self.assertEqual(self._answer(self.prompt), auto.ENTER)
         # The prompt is gone (answer landed): nothing to re-send, state clears.
-        self.assertIsNone(
-            self.a.on_timeout("command output", now=1.5, output_since_answer=False)
-        )
-        self.assertFalse(self.a.retry_pending())
+        self.assertIsNone(self.a.consider("command output", now=1.5))
+        self.assertFalse(self.a.needs_tick())
 
-    def test_reset_forgets_the_outstanding_answer(self):
-        self.a.on_idle(self.prompt, now=0.0)
+    def test_reset_forgets_the_tracked_prompt(self):
+        self.a.consider(self.prompt, now=0.0)
         self.a.reset()
-        self.assertFalse(self.a.retry_pending())
-        # After a reset the same screen is treated as fresh again.
-        self.assertEqual(self.a.on_idle(self.prompt, now=0.1), auto.ENTER)
+        self.assertFalse(self.a.needs_tick())
+        # After a reset the same prompt is tracked fresh again.
+        self.assertEqual(self._answer(self.prompt, t0=0.1), auto.ENTER)
 
 
 @unittest.skipUnless(POSIX, "PTY/termios winsize is POSIX-only")
