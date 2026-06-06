@@ -331,6 +331,51 @@ class AnswererTests(unittest.TestCase):
         self.assertEqual(self._answer(self.prompt, t0=0.1), auto.ENTER)
 
 
+class DebugCaptureTests(unittest.TestCase):
+    """The opt-in AUTO_DEBUG sink that records what auto sees per screen."""
+
+    def setUp(self):
+        self.patterns = auto.compile_patterns("claude")
+
+    def test_append_debug_records_tail_and_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "log")
+            match = auto.match_prompt_ex("Do you want to proceed?", self.patterns)
+            auto.append_debug(path, 1.5, "Do you want to proceed?", match)
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        self.assertIn("MATCH", text)
+        self.assertIn("Do you want to proceed", text)
+
+    def test_append_debug_records_a_miss(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "log")
+            auto.append_debug(path, 0.0, "some garbled screen", None)
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        self.assertIn("NO MATCH", text)
+
+    def test_append_debug_swallows_bad_path(self):
+        # A directory that does not exist must not raise into the event loop.
+        auto.append_debug("/no/such/dir/log", 0.0, "x", None)
+
+    def test_answerer_logs_only_when_tail_changes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "log")
+            a = auto.Answerer(self.patterns, debug_path=path)
+            a.consider("Do you want to proceed?", now=0.0)
+            a.consider("Do you want to proceed?", now=0.1)  # unchanged: no log
+            a.consider("a different screen", now=0.2)
+            with open(path, encoding="utf-8") as f:
+                blocks = f.read().count("-----") // 2
+        self.assertEqual(blocks, 2)
+
+    def test_answerer_without_debug_writes_nothing(self):
+        # Default construction (no AUTO_DEBUG) must not touch the filesystem.
+        a = auto.Answerer(self.patterns)
+        self.assertIsNone(a.consider("Do you want to proceed?", now=0.0))
+
+
 @unittest.skipUnless(POSIX, "PTY/termios winsize is POSIX-only")
 class WinsizeTests(unittest.TestCase):
     def _closed_fd(self):

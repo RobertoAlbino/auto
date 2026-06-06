@@ -42,7 +42,7 @@ if POSIX:
     import termios
     import tty
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 
 ENTER = b"\r"
 
@@ -154,6 +154,27 @@ def match_prompt(tail, patterns):
     return match[0] if match is not None else None
 
 
+def append_debug(path, now, tail, match):
+    """Append one diagnostic record (the visible tail + match result) to `path`.
+
+    Opt-in via the `AUTO_DEBUG` env var. When a prompt is missed, the regexes
+    almost always match the clean text, so the real cause hides in what the PTY
+    actually delivered -- a tail garbled by escape sequences or a partial
+    redraw. Dumping the exact tail and whether it matched is what turns "auto
+    didn't catch it" into a reproducible, fixable record. Never raises into the
+    event loop: a debug sink that fails must not take the wrapper down with it.
+    """
+    try:
+        sig = match[1] if match is not None else None
+        verdict = f"MATCH {sig!r}" if match is not None else "NO MATCH"
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"\n----- t={now:.3f} {verdict} -----\n")
+            f.write(tail)
+            f.write("\n")
+    except OSError:
+        pass
+
+
 class Answerer:
     """Decides what (if anything) to send to an auto-answered tool.
 
@@ -176,11 +197,17 @@ class Answerer:
     """
 
     def __init__(self, patterns, stable_secs=IDLE_SECS,
-                 retry_secs=ANSWER_RETRY_SECS, max_retries=MAX_ANSWER_RETRIES):
+                 retry_secs=ANSWER_RETRY_SECS, max_retries=MAX_ANSWER_RETRIES,
+                 debug_path=None):
         self.patterns = patterns
         self.stable_secs = stable_secs
         self.retry_secs = retry_secs
         self.max_retries = max_retries
+        # Optional diagnostic sink (the AUTO_DEBUG path). When set, each changed
+        # screen is recorded with its match verdict so a missed prompt can be
+        # inspected after the fact. `_last_logged` dedups identical tails.
+        self.debug_path = debug_path
+        self._last_logged = None
         self.reset()
 
     def reset(self):
@@ -210,6 +237,9 @@ class Answerer:
         that lingers is re-sent up to `max_retries` times.
         """
         match = match_prompt_ex(tail, self.patterns)
+        if self.debug_path and tail != self._last_logged:
+            self._last_logged = tail
+            append_debug(self.debug_path, now, tail, match)
         if match is None:
             self.reset()                       # no prompt on screen anymore
             return None
@@ -354,7 +384,8 @@ def _run_posix(tool, patterns):
         tty.setraw(stdin_fd)
 
     raw_buffer = bytearray()
-    answerer = Answerer(patterns)   # decides what to send (and when to re-send)
+    # decides what to send (and when to re-send); AUTO_DEBUG records what it sees
+    answerer = Answerer(patterns, debug_path=os.environ.get("AUTO_DEBUG"))
     exit_code = 0
 
     try:
@@ -670,7 +701,7 @@ if WINDOWS:
         lock = threading.Lock()
         done = threading.Event()
         state = {"buffer": bytearray(), "user_typed": False}
-        answerer = Answerer(patterns)
+        answerer = Answerer(patterns, debug_path=os.environ.get("AUTO_DEBUG"))
 
         def _pump_output():
             buf = (ctypes.c_char * 4096)()
