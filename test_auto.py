@@ -188,6 +188,22 @@ class MatchPromptTests(unittest.TestCase):
             auto.match_prompt("Allow this command?", self.codex), auto.ENTER
         )
 
+    def test_codex_run_command_question(self):
+        tail = (
+            "Would you like to run the following command?\n"
+            " \n"
+            "  Reason: Permite rodar os testes de integração com Testcontainers "
+            "acessando o Docker local?\n"
+            " \n"
+            "  $ ./mvnw test\n"
+            " \n"
+            "› 1. Yes, proceed (y)\n"
+            "  2. Yes, and don't ask again for commands that start with "
+            "`./mvnw test` (p)\n"
+            "  3. No, and tell Codex what to do differently (esc)"
+        )
+        self.assertEqual(auto.match_prompt(tail, self.codex), auto.ENTER)
+
     def test_codex_approve(self):
         self.assertEqual(
             auto.match_prompt("Approve changes", self.codex), auto.ENTER

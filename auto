@@ -42,7 +42,7 @@ if POSIX:
     import termios
     import tty
 
-__version__ = "0.1.6"
+__version__ = "0.1.7"
 
 ENTER = b"\r"
 
@@ -66,6 +66,7 @@ TOOLS = {
     ],
     "codex": [
         (r"Allow.*\?", ENTER),
+        (r"Would you like to run the following command\?", ENTER),
         (r"Approve", ENTER),
         *YES_MENU_PATTERNS,
         (r"[\[(]\s*y\s*/\s*n\s*[\])]", b"y\r"),
