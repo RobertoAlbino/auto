@@ -183,6 +183,33 @@ class MatchPromptTests(unittest.TestCase):
             auto.match_prompt("1. Yes\n2. No", self.claude), auto.ENTER
         )
 
+    def test_claude_tall_prompt_survives_footer_churn(self):
+        # Regression: a long, multi-line command (a commit with a heredoc
+        # message) makes the box tall, and while the prompt sits there the tool
+        # keeps redrawing its footer (input box, hints, spinner) at the bottom.
+        # Those frames are appended after the question in the byte stream, so the
+        # rolling buffer evicts the question once enough of them accumulate. With
+        # the old 8 KB cap that happened almost immediately; the production
+        # BUFFER_LIMIT must hold the question through the churn.
+        box = (
+            "│ git -C /Users/me/Projetos/links/frontend add -A && git commit -q │\n"
+            "│ -m \"$(cat <<'EOF' ... EOF )\" && git push origin master           │\n"
+            "│ Commit and push saved message position                          │\n"
+            "│ Do you want to proceed?                                         │\n"
+            "│ ❯ 1. Yes                                                        │\n"
+            "│   2. Yes, and don't ask again for: ...                          │\n"
+            "│   3. No                                                         │\n"
+            "╰─────────────────────────────────────────────────────────────────╯\n"
+        ).encode()
+        # One spinner/footer repaint, complete with cursor positioning, as the
+        # tool emits on every animation tick below the box.
+        frame = b"\x1b[20;1H  Working\xe2\x80\xa6 (12s \xc2\xb7 esc to interrupt)\x1b[0K"
+        # ~10 KB of churn: past the old 8 KB cap, comfortably inside the new one.
+        raw = box + frame * (10000 // len(frame))
+        retained = bytes(raw)[-auto.BUFFER_LIMIT:]
+        tail = auto.visible_tail(retained)
+        self.assertEqual(auto.match_prompt(tail, self.claude), auto.ENTER)
+
     def test_codex_allow_question(self):
         self.assertEqual(
             auto.match_prompt("Allow this command?", self.codex), auto.ENTER

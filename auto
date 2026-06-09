@@ -42,7 +42,7 @@ if POSIX:
     import termios
     import tty
 
-__version__ = "0.1.7"
+__version__ = "0.1.8"
 
 ENTER = b"\r"
 
@@ -76,8 +76,16 @@ TOOLS = {
 # Regex that strips ANSI escape sequences (colors, cursor positioning, etc.).
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[\(\)][AB012]|\x1b[=>]|\r")
 
-BUFFER_LIMIT = 8192          # raw bytes kept for detection
-TAIL_LINES = 12              # how many visible lines to inspect when matching
+# A full redraw of a colored TUI screen is easily 10-20 KB of ANSI, and a tall
+# confirmation (a long, multi-line command in the box) is larger still. The cap
+# must comfortably hold one such screen plus the footer/spinner frames the tool
+# keeps appending while the prompt sits there -- otherwise the question scrolls
+# out of the retained window and the prompt is never answered.
+BUFFER_LIMIT = 65536         # raw bytes kept for detection
+# Enough lines to reach back past the tool's footer (input box, hints, status,
+# spinner) to the question line of a tall prompt, without dredging up stale
+# scrollback from earlier in the conversation.
+TAIL_LINES = 40              # how many visible lines to inspect when matching
 # How long a prompt must stay continuously on screen before we answer it. This
 # is a stability window, NOT a whole-screen idle gate: the tool often keeps
 # repainting an animated element (a spinner, an elapsed-time counter, an "esc
