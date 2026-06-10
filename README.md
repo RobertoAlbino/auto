@@ -32,9 +32,9 @@ auto --version  # print the running version and exit
 
 If `auto` leaves a confirmation sitting unanswered, set `AUTO_DEBUG` to a file
 path before launching: every screen `auto` inspects is appended there with
-whether it matched a prompt. That captures exactly what the wrapped tool sent
-through the PTY, which is what is needed to tell a regex gap apart from a
-garbled / partial redraw.
+whether it matched a prompt. That captures exactly what `auto` reconstructed
+as the visible screen, which is what is needed to tell a regex gap apart from
+a rendering sequence the screen model mishandled.
 
 ```sh
 AUTO_DEBUG=/tmp/auto.log auto claude

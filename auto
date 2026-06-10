@@ -16,13 +16,16 @@ confirmation prompts.
 
 Platforms: Linux and macOS use a POSIX PTY (`pty.fork`). Windows uses a
 ConPTY pseudoconsole driven through `ctypes` (no third-party dependency;
-requires Windows 10 1809+). The prompt-detection logic is shared.
+requires Windows 10 1809+). The prompt-detection logic is shared: the PTY
+stream feeds a small terminal-screen emulator, and the patterns are matched
+against what is actually visible on screen.
 
 SECURITY WARNING: auto-accepting EVERYTHING also bypasses confirmations for
 destructive actions. Prefer running it inside a throwaway directory. See
 README.md.
 """
 
+import codecs
 import errno
 import os
 import re
@@ -42,7 +45,7 @@ if POSIX:
     import termios
     import tty
 
-__version__ = "0.1.8"
+__version__ = "0.1.9"
 
 ENTER = b"\r"
 
@@ -73,19 +76,6 @@ TOOLS = {
     ],
 }
 
-# Regex that strips ANSI escape sequences (colors, cursor positioning, etc.).
-ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[\(\)][AB012]|\x1b[=>]|\r")
-
-# A full redraw of a colored TUI screen is easily 10-20 KB of ANSI, and a tall
-# confirmation (a long, multi-line command in the box) is larger still. The cap
-# must comfortably hold one such screen plus the footer/spinner frames the tool
-# keeps appending while the prompt sits there -- otherwise the question scrolls
-# out of the retained window and the prompt is never answered.
-BUFFER_LIMIT = 65536         # raw bytes kept for detection
-# Enough lines to reach back past the tool's footer (input box, hints, status,
-# spinner) to the question line of a tall prompt, without dredging up stale
-# scrollback from earlier in the conversation.
-TAIL_LINES = 40              # how many visible lines to inspect when matching
 # How long a prompt must stay continuously on screen before we answer it. This
 # is a stability window, NOT a whole-screen idle gate: the tool often keeps
 # repainting an animated element (a spinner, an elapsed-time counter, an "esc
@@ -122,16 +112,324 @@ def compile_patterns(tool):
     return [(re.compile(rx, re.IGNORECASE), keys) for rx, keys in TOOLS[tool]]
 
 
-def strip_ansi(text):
-    """Remove ANSI escape sequences and carriage returns from text."""
-    return ANSI_RE.sub("", text)
+# --------------------------------------------------------------------------
+# Screen model.
+#
+# Detection used to run on the tail of the raw byte stream with the ANSI
+# escapes stripped out. That representation cannot answer the one question
+# that matters -- "is the prompt visible right now?" -- because a byte stream
+# is append-only: a dialog the tool has already erased keeps matching until
+# enough newlines arrive to push its text out of the tail. The visible
+# symptom was a missed "yes": when two identical confirmations arrived close
+# together, the second was indistinguishable from the stale text of the first
+# (same matched text, already answered) and was never answered. The converse
+# also happened -- answers re-sent at text that was no longer on screen.
+#
+# So interpret the escape sequences instead of stripping them: keep the grid
+# of characters a real terminal would show. Erased text actually disappears,
+# a still-up dialog actually persists, and matching the screen means matching
+# what the user can see. Only the control sequences the wrapped TUIs emit
+# (cursor motion, erasing, scrolling, the alternate screen) need to be
+# honoured; colors/styles are ignored.
+# --------------------------------------------------------------------------
+
+# One terminal "token": a complete escape sequence or a single C0 control.
+_TOKEN_RE = re.compile(
+    "\x1b\\[[0-9;:?>=!<]*[ -/]*[@-~]"          # CSI ... final byte
+    "|\x1b\\][^\x07\x1b]*(?:\x07|\x1b\\\\)?"   # OSC (window title etc.)
+    "|\x1b[P^_X][^\x1b]*(?:\x1b\\\\)?"         # DCS / PM / APC / SOS
+    "|\x1b[()*+#%]."                           # charset & line-size selectors
+    "|\x1b."                                   # any other two-char escape
+    "|[\x00-\x1a\x1c-\x1f\x7f]"                # C0 controls except ESC
+)
+
+# A trailing fragment that is the *start* of an escape sequence whose end has
+# not arrived yet: PTY reads are arbitrary 4 KB chunks, so sequences split.
+_PARTIAL_RE = re.compile(
+    "\x1b\\[[0-9;:?>=!<]*[ -/]*"   # CSI missing its final byte
+    "|\x1b\\][^\x07\x1b]*"         # OSC missing its terminator
+    "|\x1b[P^_X][^\x1b]*"          # DCS/PM/APC missing its terminator
+    "|\x1b[()*+#%]"                # charset selector missing its charset
+    "|\x1b"                        # bare escape
+)
 
 
-def visible_tail(raw_buffer, tail_lines=TAIL_LINES):
-    """Strip ANSI codes and return the last `tail_lines` lines as one string."""
-    text = strip_ansi(raw_buffer.decode("utf-8", errors="replace"))
-    lines = text.split("\n")
-    return "\n".join(lines[-tail_lines:])
+class Screen:
+    """What the terminal currently shows, reconstructed from the PTY stream.
+
+    feed() bytes as they arrive; text() returns the visible grid, one string
+    per row joined with newlines (trailing blanks stripped). Handles the
+    sequences claude/codex actually emit: absolute and relative cursor
+    motion, line/display erasing, scrolling (with regions), insert/delete of
+    lines and characters, the alternate screen, and save/restore cursor.
+    Styling and anything unrecognized are ignored.
+    """
+
+    _PENDING_MAX = 8192  # give up on an unterminated OSC/DCS at this size
+
+    def __init__(self, rows=24, cols=80):
+        self.rows = max(1, rows)
+        self.cols = max(1, cols)
+        self._decoder = codecs.getincrementaldecoder("utf-8")("replace")
+        self._pending = ""             # escape sequence split across feeds
+        self._main = self._blank_grid()
+        self._alt = self._blank_grid()
+        self._grid = self._main
+        self._on_alt = False
+        self.row = 0
+        self.col = 0
+        self._saved = (0, 0)
+        self._top = 0                  # scroll region, inclusive
+        self._bot = self.rows - 1
+
+    def _blank_row(self):
+        return [" "] * self.cols
+
+    def _blank_grid(self):
+        return [self._blank_row() for _ in range(self.rows)]
+
+    def _clamped(self, row, col):
+        return (min(max(row, 0), self.rows - 1),
+                min(max(col, 0), self.cols - 1))
+
+    def text(self):
+        """The visible screen as one string, one line per row."""
+        return "\n".join("".join(line).rstrip() for line in self._grid)
+
+    def resize(self, rows, cols):
+        """Match a terminal resize, preserving the top-left of the content."""
+        rows, cols = max(1, rows), max(1, cols)
+        for grid in (self._main, self._alt):
+            for line in grid:
+                if cols > len(line):
+                    line.extend(" " * (cols - len(line)))
+                else:
+                    del line[cols:]
+            while len(grid) < rows:
+                grid.append([" "] * cols)
+            del grid[rows:]
+        self.rows, self.cols = rows, cols
+        self._top, self._bot = 0, rows - 1
+        self.row, self.col = self._clamped(self.row, self.col)
+
+    def feed(self, data):
+        """Interpret a chunk of PTY output and update the grid."""
+        text = self._pending + self._decoder.decode(data)
+        self._pending = ""
+        # Hold back a trailing incomplete escape sequence for the next chunk.
+        cut = text.rfind("\x1b")
+        if (cut != -1 and len(text) - cut <= self._PENDING_MAX
+                and _PARTIAL_RE.fullmatch(text, cut)):
+            self._pending = text[cut:]
+            text = text[:cut]
+        pos = 0
+        for m in _TOKEN_RE.finditer(text):
+            if m.start() > pos:
+                self._put(text[pos:m.start()])
+            self._control(m.group(0))
+            pos = m.end()
+        if pos < len(text):
+            self._put(text[pos:])
+
+    def _put(self, run):
+        """Write printable text at the cursor, wrapping at the right edge."""
+        while run:
+            space = self.cols - self.col
+            if space <= 0:
+                self._linefeed()
+                self.col = 0
+                space = self.cols
+            chunk = run[:space]
+            line = self._grid[self.row]
+            line[self.col:self.col + len(chunk)] = list(chunk)
+            self.col += len(chunk)
+            run = run[len(chunk):]
+
+    def _linefeed(self):
+        if self.row == self._bot:
+            self._scroll_up(1)
+        elif self.row < self.rows - 1:
+            self.row += 1
+
+    def _reverse_linefeed(self):
+        if self.row == self._top:
+            self._scroll_down(1)
+        elif self.row > 0:
+            self.row -= 1
+
+    def _scroll_up(self, n):
+        n = min(n, self._bot - self._top + 1)
+        region = self._grid[self._top:self._bot + 1]
+        self._grid[self._top:self._bot + 1] = (
+            region[n:] + [self._blank_row() for _ in range(n)])
+
+    def _scroll_down(self, n):
+        n = min(n, self._bot - self._top + 1)
+        region = self._grid[self._top:self._bot + 1]
+        self._grid[self._top:self._bot + 1] = (
+            [self._blank_row() for _ in range(n)] + region[:len(region) - n])
+
+    def _erase_line(self, mode):
+        line = self._grid[self.row]
+        if mode == 1:
+            end = min(self.cols, self.col + 1)
+            line[:end] = [" "] * end
+        elif mode == 2:
+            line[:] = [" "] * self.cols
+        else:
+            line[self.col:] = [" "] * (self.cols - self.col)
+
+    def _erase_display(self, mode):
+        if mode == 1:
+            for r in range(self.row):
+                self._grid[r] = self._blank_row()
+            self._erase_line(1)
+        elif mode in (2, 3):
+            for r in range(self.rows):
+                self._grid[r] = self._blank_row()
+        else:
+            self._erase_line(0)
+            for r in range(self.row + 1, self.rows):
+                self._grid[r] = self._blank_row()
+
+    def _insert_lines(self, n):
+        if not (self._top <= self.row <= self._bot):
+            return
+        n = min(n, self._bot - self.row + 1)
+        span = self._grid[self.row:self._bot + 1]
+        self._grid[self.row:self._bot + 1] = (
+            [self._blank_row() for _ in range(n)] + span[:len(span) - n])
+
+    def _delete_lines(self, n):
+        if not (self._top <= self.row <= self._bot):
+            return
+        n = min(n, self._bot - self.row + 1)
+        span = self._grid[self.row:self._bot + 1]
+        self._grid[self.row:self._bot + 1] = (
+            span[n:] + [self._blank_row() for _ in range(n)])
+
+    def _insert_chars(self, n):
+        line = self._grid[self.row]
+        n = min(n, self.cols - self.col)
+        line[self.col:] = ([" "] * n + line[self.col:])[:self.cols - self.col]
+
+    def _delete_chars(self, n):
+        line = self._grid[self.row]
+        n = min(n, self.cols - self.col)
+        line[self.col:] = line[self.col + n:] + [" "] * n
+
+    def _set_alt(self, on):
+        if on and not self._on_alt:
+            self._on_alt = True
+            self._saved = (self.row, self.col)
+            self._alt[:] = self._blank_grid()
+            self._grid = self._alt
+            self.row = self.col = 0
+        elif not on and self._on_alt:
+            self._on_alt = False
+            self._grid = self._main
+            self.row, self.col = self._clamped(*self._saved)
+
+    def _control(self, seq):
+        ch = seq[0]
+        if ch != "\x1b":
+            if ch == "\n":
+                self._linefeed()
+            elif ch == "\r":
+                self.col = 0
+            elif ch == "\b":
+                self.col = max(0, self.col - 1)
+            elif ch == "\t":
+                self.col = min(self.cols - 1, (self.col // 8 + 1) * 8)
+            return
+        kind = seq[1] if len(seq) > 1 else ""
+        if kind == "[":
+            self._csi(seq)
+        elif kind == "7":
+            self._saved = (self.row, self.col)
+        elif kind == "8":
+            self.row, self.col = self._clamped(*self._saved)
+        elif kind == "D":
+            self._linefeed()
+        elif kind == "E":
+            self._linefeed()
+            self.col = 0
+        elif kind == "M":
+            self._reverse_linefeed()
+        elif kind == "c":
+            self._grid[:] = self._blank_grid()
+            self.row = self.col = 0
+            self._top, self._bot = 0, self.rows - 1
+        # OSC/DCS/charset selectors and the rest have no visible effect.
+
+    def _csi(self, seq):
+        final = seq[-1]
+        body = seq[2:-1]
+        private = body.startswith("?")
+        body = body.lstrip("?>=!<").rstrip(" !\"#$%&'()*+,-./")
+        params = [int(part) if part.isdigit() else 0
+                  for part in body.split(";")] if body else []
+
+        def p(i, default=1):
+            value = params[i] if i < len(params) else 0
+            return value if value > 0 else default
+
+        if final == "A":
+            self.row = max(0, self.row - p(0))
+        elif final in "Be":
+            self.row = min(self.rows - 1, self.row + p(0))
+        elif final in "Ca":
+            self.col = min(self.cols - 1, self.col + p(0))
+        elif final == "D":
+            self.col = max(0, self.col - p(0))
+        elif final == "E":
+            self.row = min(self.rows - 1, self.row + p(0))
+            self.col = 0
+        elif final == "F":
+            self.row = max(0, self.row - p(0))
+            self.col = 0
+        elif final in "G`":
+            self.col = min(self.cols - 1, max(0, p(0) - 1))
+        elif final == "d":
+            self.row = min(self.rows - 1, max(0, p(0) - 1))
+        elif final in "Hf":
+            self.row, self.col = self._clamped(p(0) - 1, p(1) - 1)
+        elif final == "J":
+            self._erase_display(params[0] if params else 0)
+        elif final == "K":
+            self._erase_line(params[0] if params else 0)
+        elif final == "L":
+            self._insert_lines(p(0))
+        elif final == "M":
+            self._delete_lines(p(0))
+        elif final == "@":
+            self._insert_chars(p(0))
+        elif final == "P":
+            self._delete_chars(p(0))
+        elif final == "X":
+            end = min(self.cols, self.col + p(0))
+            self._grid[self.row][self.col:end] = [" "] * (end - self.col)
+        elif final == "S":
+            self._scroll_up(p(0))
+        elif final == "T":
+            self._scroll_down(p(0))
+        elif final == "r":
+            top = p(0) - 1
+            bot = (params[1] if len(params) > 1 and params[1] else self.rows) - 1
+            if 0 <= top < bot <= self.rows - 1:
+                self._top, self._bot = top, bot
+            else:
+                self._top, self._bot = 0, self.rows - 1
+            self.row = self.col = 0
+        elif final in "hl" and private:
+            # Only the alternate screen changes what is visible; cursor
+            # visibility, bracketed paste, mouse modes etc. do not.
+            if any(mode in params for mode in (47, 1047, 1049)):
+                self._set_alt(final == "h")
+        elif final == "s":
+            self._saved = (self.row, self.col)
+        elif final == "u":
+            self.row, self.col = self._clamped(*self._saved)
 
 
 def match_prompt_ex(tail, patterns):
@@ -167,11 +465,11 @@ def append_debug(path, now, tail, match):
     """Append one diagnostic record (the visible tail + match result) to `path`.
 
     Opt-in via the `AUTO_DEBUG` env var. When a prompt is missed, the regexes
-    almost always match the clean text, so the real cause hides in what the PTY
-    actually delivered -- a tail garbled by escape sequences or a partial
-    redraw. Dumping the exact tail and whether it matched is what turns "auto
-    didn't catch it" into a reproducible, fixable record. Never raises into the
-    event loop: a debug sink that fails must not take the wrapper down with it.
+    almost always match the expected text, so the real cause hides in what the
+    screen model actually reconstructed from the PTY stream. Dumping the exact
+    screen and whether it matched is what turns "auto didn't catch it" into a
+    reproducible, fixable record. Never raises into the event loop: a debug
+    sink that fails must not take the wrapper down with it.
     """
     try:
         sig = match[1] if match is not None else None
@@ -381,9 +679,15 @@ def _run_posix(tool, patterns):
     # ---- parent process ----
     set_winsize(master_fd, rows, cols)
 
+    # The handler only forwards the new size to the PTY (which prompts the
+    # child to repaint); the screen grid is resized in the main loop, not in
+    # signal context, so a feed() in progress is never interrupted mid-update.
+    pending_resize = []
+
     def handle_winch(signum, frame):
         r, c = get_winsize(stdin_fd)
         set_winsize(master_fd, r, c)
+        pending_resize[:] = [(r, c)]
 
     signal.signal(signal.SIGWINCH, handle_winch)
 
@@ -392,7 +696,7 @@ def _run_posix(tool, patterns):
         old_term = termios.tcgetattr(stdin_fd)
         tty.setraw(stdin_fd)
 
-    raw_buffer = bytearray()
+    screen = Screen(rows, cols)
     # decides what to send (and when to re-send); AUTO_DEBUG records what it sees
     answerer = Answerer(patterns, debug_path=os.environ.get("AUTO_DEBUG"))
     exit_code = 0
@@ -410,6 +714,9 @@ def _run_posix(tool, patterns):
                     continue  # interrupted by SIGWINCH; resume
                 raise
 
+            if pending_resize:
+                screen.resize(*pending_resize.pop())
+
             if master_fd in rlist:
                 try:
                     data = os.read(master_fd, 4096)
@@ -418,9 +725,7 @@ def _run_posix(tool, patterns):
                 if not data:
                     break  # child closed the PTY -> it exited
                 os.write(stdout_fd, data)
-                raw_buffer.extend(data)
-                if len(raw_buffer) > BUFFER_LIMIT:
-                    del raw_buffer[:-BUFFER_LIMIT]
+                screen.feed(data)
 
             if stdin_fd in rlist:
                 try:
@@ -436,8 +741,7 @@ def _run_posix(tool, patterns):
             # Inspect the screen every tick. The answerer keys on the matched
             # prompt text, so it answers a prompt that has held still long
             # enough even while a spinner keeps the rest of the screen churning.
-            keys = answerer.consider(visible_tail(bytes(raw_buffer)),
-                                     time.monotonic())
+            keys = answerer.consider(screen.text(), time.monotonic())
             if keys is not None:
                 os.write(master_fd, keys)
     finally:
@@ -462,8 +766,8 @@ def _run_posix(tool, patterns):
 
 # --------------------------------------------------------------------------
 # Windows: ConPTY pseudoconsole, driven through ctypes (no dependencies).
-# Mirrors the POSIX path: write the child's output to the real console, keep a
-# rolling buffer, and after an idle gap inspect the tail and inject keystrokes.
+# Mirrors the POSIX path: write the child's output to the real console, feed
+# it into the screen model, and inspect the visible screen on every tick.
 # Requires Windows 10 1809+ (the first build with the ConPTY API).
 # --------------------------------------------------------------------------
 if WINDOWS:
@@ -709,7 +1013,8 @@ if WINDOWS:
 
         lock = threading.Lock()
         done = threading.Event()
-        state = {"buffer": bytearray(), "user_typed": False}
+        state = {"user_typed": False}
+        screen = Screen(rows, cols)
         answerer = Answerer(patterns, debug_path=os.environ.get("AUTO_DEBUG"))
 
         def _pump_output():
@@ -724,9 +1029,7 @@ if WINDOWS:
                 data = bytes(buf[:nread.value])
                 _kernel32.WriteFile(stdout_h, data, len(data), ctypes.byref(wn), None)
                 with lock:
-                    state["buffer"].extend(data)
-                    if len(state["buffer"]) > BUFFER_LIMIT:
-                        del state["buffer"][:-BUFFER_LIMIT]
+                    screen.feed(data)
             done.set()
 
         def _pump_input():
@@ -758,7 +1061,7 @@ if WINDOWS:
                 with lock:
                     user_typed = state["user_typed"]
                     state["user_typed"] = False
-                    tail = visible_tail(bytes(state["buffer"]))
+                    tail = screen.text()
                 if user_typed:
                     # the user interacted: don't fight them on the current prompt
                     answerer.reset()
@@ -775,6 +1078,8 @@ if WINDOWS:
                 if (r, c) != last_size:
                     last_size = (r, c)
                     _kernel32.ResizePseudoConsole(hpc, _COORD(c, r))
+                    with lock:
+                        screen.resize(r, c)
         finally:
             _kernel32.WaitForSingleObject(pi.hProcess, _INFINITE)
             code = wintypes.DWORD(0)

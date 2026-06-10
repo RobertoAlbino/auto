@@ -82,52 +82,117 @@ class CompilePatternsTests(unittest.TestCase):
             auto.compile_patterns("nope")
 
 
-class StripAnsiTests(unittest.TestCase):
-    def test_removes_color_codes(self):
-        self.assertEqual(auto.strip_ansi("\x1b[31mred\x1b[0m"), "red")
+class ScreenTests(unittest.TestCase):
+    """The terminal-screen emulator that prompt detection runs against."""
 
-    def test_removes_cursor_positioning(self):
-        self.assertEqual(auto.strip_ansi("\x1b[2J\x1b[Hhi"), "hi")
+    def screen(self, rows=24, cols=80):
+        return auto.Screen(rows, cols)
 
-    def test_removes_carriage_returns(self):
-        self.assertEqual(auto.strip_ansi("a\rb"), "ab")
+    def test_plain_text_and_newlines(self):
+        s = self.screen()
+        s.feed(b"hello\r\nworld")
+        self.assertEqual(s.text().split("\n")[:2], ["hello", "world"])
 
-    def test_removes_charset_and_mode_sequences(self):
-        self.assertEqual(auto.strip_ansi("\x1b(B\x1b=text\x1b>"), "text")
+    def test_carriage_return_overwrites_the_line(self):
+        s = self.screen()
+        s.feed(b"abc\rX")
+        self.assertEqual(s.text().split("\n")[0], "Xbc")
 
-    def test_keeps_plain_text_untouched(self):
-        self.assertEqual(auto.strip_ansi("plain text\n"), "plain text\n")
+    def test_colors_are_ignored(self):
+        s = self.screen()
+        s.feed(b"\x1b[32m1. Yes\x1b[0m")
+        self.assertIn("1. Yes", s.text())
 
-    def test_keeps_newlines(self):
-        self.assertEqual(auto.strip_ansi("a\nb"), "a\nb")
+    def test_invalid_utf8_does_not_raise(self):
+        s = self.screen()
+        s.feed(b"\xffYes")
+        self.assertIn("Yes", s.text())
 
+    def test_erased_dialog_disappears(self):
+        # The core property the stream-tail model lacked: once the tool erases
+        # its confirmation dialog, the text must stop matching.
+        s = self.screen()
+        s.feed("Do you want to proceed?\r\n❯ 1. Yes\r\n  2. No".encode())
+        self.assertIn("Yes", s.text())
+        s.feed(b"\r\x1b[2A\x1b[J")  # col 0, up to the question, erase below
+        self.assertNotIn("Yes", s.text())
 
-class VisibleTailTests(unittest.TestCase):
-    def test_returns_only_last_lines(self):
-        raw = "\n".join(str(i) for i in range(50)).encode()
-        tail = auto.visible_tail(raw, tail_lines=3)
-        self.assertEqual(tail, "47\n48\n49")
+    def test_cursor_up_rewrite_replaces_the_menu(self):
+        # ink-style repaint: erase the previous frame line by line, rewrite.
+        s = self.screen()
+        s.feed("❯ 1. Yes\r\n  2. No\r\n".encode())
+        s.feed(b"\x1b[2K\x1b[1A\x1b[2K\x1b[1A\x1b[2K\x1b[G")
+        s.feed(b"Done.")
+        self.assertNotIn("Yes", s.text())
+        self.assertIn("Done.", s.text())
 
-    def test_respects_custom_tail_lines(self):
-        raw = b"a\nb\nc\nd"
-        self.assertEqual(auto.visible_tail(raw, tail_lines=2), "c\nd")
+    def test_absolute_positioning(self):
+        s = self.screen()
+        s.feed(b"\x1b[5;10HYes")
+        self.assertEqual(s.text().split("\n")[4][9:12], "Yes")
 
-    def test_returns_all_lines_when_fewer_than_limit(self):
-        self.assertEqual(auto.visible_tail(b"x\ny", tail_lines=10), "x\ny")
+    def test_clear_screen(self):
+        s = self.screen()
+        s.feed(b"something\x1b[2J")
+        self.assertEqual(s.text().strip(), "")
 
-    def test_strips_ansi_before_splitting(self):
-        raw = b"\x1b[32m1. Yes\x1b[0m"
-        self.assertEqual(auto.visible_tail(raw, tail_lines=1), "1. Yes")
+    def test_erase_to_end_of_line(self):
+        s = self.screen()
+        s.feed(b"1. Yes\r\x1b[K")
+        self.assertNotIn("Yes", s.text())
 
-    def test_handles_invalid_utf8_without_raising(self):
-        # 0xff is not valid UTF-8; errors="replace" must keep it from crashing.
-        tail = auto.visible_tail(b"\xffYes", tail_lines=1)
-        self.assertIn("Yes", tail)
+    def test_scrolls_at_the_bottom(self):
+        s = self.screen(rows=3)
+        s.feed(b"one\r\ntwo\r\nthree\r\nfour")
+        self.assertEqual(s.text(), "two\nthree\nfour")
 
-    def test_default_tail_lines_matches_constant(self):
-        raw = ("\n".join(str(i) for i in range(auto.TAIL_LINES + 5))).encode()
-        tail = auto.visible_tail(raw)
-        self.assertEqual(len(tail.split("\n")), auto.TAIL_LINES)
+    def test_wraps_long_lines(self):
+        s = self.screen(rows=3, cols=10)
+        s.feed(b"a" * 12)
+        lines = s.text().split("\n")
+        self.assertEqual(lines[0], "a" * 10)
+        self.assertEqual(lines[1], "aa")
+
+    def test_alternate_screen_hides_and_restores_main(self):
+        # codex (ratatui) runs on the alternate screen.
+        s = self.screen()
+        s.feed(b"main text")
+        s.feed(b"\x1b[?1049halt text")
+        self.assertIn("alt text", s.text())
+        self.assertNotIn("main text", s.text())
+        s.feed(b"\x1b[?1049l")
+        self.assertIn("main text", s.text())
+        self.assertNotIn("alt text", s.text())
+
+    def test_escape_sequence_split_across_feeds(self):
+        # Reads are arbitrary 4 KB chunks, so sequences split mid-escape.
+        s = self.screen()
+        s.feed(b"Yes\r")
+        s.feed(b"\x1b[")
+        s.feed(b"K")  # the erase-to-right only completes here
+        self.assertNotIn("Yes", s.text())
+
+    def test_utf8_split_across_feeds(self):
+        raw = "❯ 1. Yes".encode()
+        s = self.screen()
+        s.feed(raw[:1])
+        s.feed(raw[1:])
+        self.assertIn("❯ 1. Yes", s.text())
+
+    def test_window_title_is_invisible(self):
+        # An OSC title that quotes prompt-like text must not match anything.
+        s = self.screen()
+        s.feed(b"\x1b]0;Do you want to proceed?\x07ok")
+        self.assertNotIn("proceed", s.text())
+        self.assertIn("ok", s.text())
+
+    def test_resize_preserves_content(self):
+        s = self.screen(rows=5, cols=20)
+        s.feed(b"keep me")
+        s.resize(10, 40)
+        self.assertIn("keep me", s.text())
+        s.resize(2, 4)
+        self.assertEqual(s.text().split("\n")[0], "keep")
 
 
 class MatchPromptTests(unittest.TestCase):
@@ -184,31 +249,29 @@ class MatchPromptTests(unittest.TestCase):
         )
 
     def test_claude_tall_prompt_survives_footer_churn(self):
-        # Regression: a long, multi-line command (a commit with a heredoc
-        # message) makes the box tall, and while the prompt sits there the tool
-        # keeps redrawing its footer (input box, hints, spinner) at the bottom.
-        # Those frames are appended after the question in the byte stream, so the
-        # rolling buffer evicts the question once enough of them accumulate. With
-        # the old 8 KB cap that happened almost immediately; the production
-        # BUFFER_LIMIT must hold the question through the churn.
+        # Regression: while a confirmation sits on screen the tool keeps
+        # repainting its footer (input box, hints, spinner) below the box.
+        # Those frames used to evict the question from the rolling byte
+        # buffer; on the screen model the box simply stays visible however
+        # long the footer churns.
+        screen = auto.Screen(rows=24, cols=80)
         box = (
-            "│ git -C /Users/me/Projetos/links/frontend add -A && git commit -q │\n"
-            "│ -m \"$(cat <<'EOF' ... EOF )\" && git push origin master           │\n"
-            "│ Commit and push saved message position                          │\n"
-            "│ Do you want to proceed?                                         │\n"
-            "│ ❯ 1. Yes                                                        │\n"
-            "│   2. Yes, and don't ask again for: ...                          │\n"
-            "│   3. No                                                         │\n"
-            "╰─────────────────────────────────────────────────────────────────╯\n"
+            "│ git -C /Users/me/Projetos/links/frontend add -A && git commit -q │\r\n"
+            "│ -m \"$(cat <<'EOF' ... EOF )\" && git push origin master           │\r\n"
+            "│ Commit and push saved message position                          │\r\n"
+            "│ Do you want to proceed?                                         │\r\n"
+            "│ ❯ 1. Yes                                                        │\r\n"
+            "│   2. Yes, and don't ask again for: ...                          │\r\n"
+            "│   3. No                                                         │\r\n"
+            "╰─────────────────────────────────────────────────────────────────╯\r\n"
         ).encode()
-        # One spinner/footer repaint, complete with cursor positioning, as the
-        # tool emits on every animation tick below the box.
-        frame = b"\x1b[20;1H  Working\xe2\x80\xa6 (12s \xc2\xb7 esc to interrupt)\x1b[0K"
-        # ~10 KB of churn: past the old 8 KB cap, comfortably inside the new one.
-        raw = box + frame * (10000 // len(frame))
-        retained = bytes(raw)[-auto.BUFFER_LIMIT:]
-        tail = auto.visible_tail(retained)
-        self.assertEqual(auto.match_prompt(tail, self.claude), auto.ENTER)
+        screen.feed(box)
+        # Spinner/footer repaints, complete with cursor positioning, emitted
+        # on every animation tick below the box -- hundreds of them.
+        frame = "\x1b[20;1H  Working… (12s · esc to interrupt)\x1b[0K".encode()
+        for _ in range(500):
+            screen.feed(frame)
+        self.assertEqual(auto.match_prompt(screen.text(), self.claude), auto.ENTER)
 
     def test_codex_allow_question(self):
         self.assertEqual(
@@ -372,6 +435,107 @@ class AnswererTests(unittest.TestCase):
         self.assertFalse(self.a.needs_tick())
         # After a reset the same prompt is tracked fresh again.
         self.assertEqual(self._answer(self.prompt, t0=0.1), auto.ENTER)
+
+
+class IdenticalPromptsRegressionTests(unittest.TestCase):
+    """Regression for the missed-"yes" bug: two identical confirmations.
+
+    With stream-tail detection the first dialog's text was still in the byte
+    buffer when the second appeared, so the second looked like "the same
+    prompt, already answered" and was never answered. On the screen model the
+    tool's erase actually removes the first dialog, which resets the answerer
+    in between.
+    """
+
+    def test_identical_second_prompt_is_answered(self):
+        screen = auto.Screen()
+        answerer = auto.Answerer(
+            auto.compile_patterns("claude"),
+            stable_secs=0.4, retry_secs=1.0, max_retries=2,
+        )
+        dialog = "Do you want to proceed?\r\n❯ 1. Yes\r\n  2. No".encode()
+
+        screen.feed(dialog)
+        self.assertIsNone(answerer.consider(screen.text(), now=0.0))
+        self.assertEqual(answerer.consider(screen.text(), now=0.4), auto.ENTER)
+
+        # The tool accepts the answer and erases the dialog...
+        screen.feed("\r\x1b[2A\x1b[J⏺ Running command\r\n".encode())
+        self.assertIsNone(answerer.consider(screen.text(), now=0.6))
+
+        # ...then asks the exact same question again moments later.
+        screen.feed(dialog)
+        self.assertIsNone(answerer.consider(screen.text(), now=1.0))
+        self.assertEqual(answerer.consider(screen.text(), now=1.5), auto.ENTER)
+
+
+@unittest.skipUnless(POSIX, "drives the real PTY event loop")
+class EndToEndTests(unittest.TestCase):
+    """Run `auto` for real against a fake TUI that asks twice."""
+
+    FAKE_TOOL = """\
+#!%(python)s
+import os
+import select
+import sys
+import termios
+import time
+
+# Raw-ish mode, like a real TUI: without ECHO off, the answer keystroke would
+# be echoed into the output and throw off the dialog's erase-cursor math.
+attrs = termios.tcgetattr(0)
+attrs[3] &= ~(termios.ECHO | termios.ICANON)
+termios.tcsetattr(0, termios.TCSANOW, attrs)
+
+def drain():
+    # A real TUI keeps reading between dialogs, so stray keystrokes (auto's
+    # bounded re-sends aimed at stale text) never pile up in the PTY queue.
+    while select.select([0], [], [], 0)[0]:
+        os.read(0, 64)
+
+def ask(n):
+    sys.stdout.write("Do you want to proceed?\\r\\n\\u276f 1. Yes\\r\\n  2. No\\r\\n")
+    sys.stdout.flush()
+    r, _, _ = select.select([0], [], [], 15)
+    if not r:
+        sys.stdout.write("TIMEOUT%%d\\r\\n" %% n)
+        sys.stdout.flush()
+        return
+    os.read(0, 64)
+    # dismiss the dialog the way a real TUI does: erase it, then go on
+    sys.stdout.write("\\x1b[3A\\x1b[J")
+    sys.stdout.write("ANSWERED%%d\\r\\n" %% n)
+    sys.stdout.flush()
+
+ask(1)
+# Wait past both of auto's bounded re-sends (1.5 s apart) before asking the
+# identical question again: the second dialog must be answered by a fresh
+# keystroke, not by a leftover retry fired at the first dialog's stale text.
+time.sleep(4)
+drain()
+ask(2)
+"""
+
+    def test_answers_two_identical_prompts_in_a_row(self):
+        import subprocess
+        import sys as _sys
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = os.path.join(tmp, "claude")
+            with open(fake, "w", encoding="utf-8") as f:
+                f.write(self.FAKE_TOOL % {"python": _sys.executable})
+            os.chmod(fake, 0o755)
+            env = dict(os.environ, PATH=tmp + os.pathsep + os.environ["PATH"])
+            proc = subprocess.run(
+                [_sys.executable, os.path.join(here, "auto"), "claude"],
+                env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, timeout=60,
+            )
+        out = proc.stdout.decode("utf-8", errors="replace")
+        self.assertIn("ANSWERED1", out)
+        self.assertIn("ANSWERED2", out)
+        self.assertNotIn("TIMEOUT", out)
 
 
 class DebugCaptureTests(unittest.TestCase):
@@ -573,9 +737,6 @@ class ConstantsTests(unittest.TestCase):
 
     def test_known_tools(self):
         self.assertEqual(set(auto.TOOLS), {"claude", "codex"})
-
-    def test_buffer_limit_positive(self):
-        self.assertGreater(auto.BUFFER_LIMIT, 0)
 
     def test_idle_secs_positive(self):
         self.assertGreater(auto.IDLE_SECS, 0)
