@@ -436,6 +436,26 @@ class AnswererTests(unittest.TestCase):
         # After a reset the same prompt is tracked fresh again.
         self.assertEqual(self._answer(self.prompt, t0=0.1), auto.ENTER)
 
+    def test_user_interaction_suppresses_prompt_until_it_disappears(self):
+        # Regression: reset() used to start a fresh 0.4 s timer. If approval
+        # text remained visible while a user typed in Codex, auto then injected
+        # ENTER into the editor in the middle of the new prompt.
+        self.a.consider(self.prompt, now=0.0)
+        self.a.user_interacted(self.prompt)
+        self.assertIsNone(self.a.consider(self.prompt, now=10.0))
+        self.assertFalse(self.a.needs_tick())
+
+        # Once the old dialog is gone, an identical future dialog is eligible.
+        self.assertIsNone(self.a.consider("working", now=10.1))
+        self.assertIsNone(self.a.consider(self.prompt, now=11.0))
+        self.assertEqual(self.a.consider(self.prompt, now=11.4), auto.ENTER)
+
+    def test_user_interaction_does_not_suppress_a_different_prompt(self):
+        self.a.user_interacted(self.prompt)
+        other = "Do you want to make this edit?"
+        self.assertIsNone(self.a.consider(other, now=1.0))
+        self.assertEqual(self.a.consider(other, now=1.5), auto.ENTER)
+
 
 class IdenticalPromptsRegressionTests(unittest.TestCase):
     """Regression for the missed-"yes" bug: two identical confirmations.

@@ -45,7 +45,7 @@ if POSIX:
     import termios
     import tty
 
-__version__ = "0.1.9"
+__version__ = "0.1.10"
 
 ENTER = b"\r"
 
@@ -518,13 +518,31 @@ class Answerer:
         self.reset()
 
     def reset(self):
-        """Forget the tracked prompt; call when the user takes over a prompt."""
+        """Forget the tracked prompt and any user-suppressed match."""
+        self.suppressed_sig = None  # prompt the user chose to handle manually
+        self._reset_tracking()
+
+    def _reset_tracking(self):
+        """Forget only the automatic-answer timing state."""
         self.sig = None           # matched text of the prompt currently up
         self.keys = None          # keys that answer it
         self.seen_at = 0.0        # when this prompt first appeared (monotonic)
         self.answered = False     # have we sent its answer yet?
         self.answered_at = 0.0    # when we last sent it (for re-sends)
         self.retries = 0          # re-sends issued for this prompt
+
+    def user_interacted(self, tail):
+        """Yield the currently visible prompt to the user until it disappears.
+
+        Merely resetting the timer is unsafe: if stale confirmation text stays
+        visible while the user types a Codex prompt, the same text is tracked
+        again and ENTER is injected after ``stable_secs``. Remembering its
+        signature prevents that match (and its retries) from interrupting the
+        editor. A different confirmation can still be answered normally.
+        """
+        match = match_prompt_ex(tail, self.patterns)
+        self.suppressed_sig = match[1] if match is not None else None
+        self._reset_tracking()
 
     def needs_tick(self):
         """Whether the loop should keep polling (vs. block until more output).
@@ -551,6 +569,9 @@ class Answerer:
             self.reset()                       # no prompt on screen anymore
             return None
         keys, sig = match
+        if sig == self.suppressed_sig:
+            return None                        # user is handling this prompt
+        self.suppressed_sig = None             # a different prompt appeared
         if sig != self.sig:
             # A new (or changed) prompt: start its stability window afresh.
             self.sig = sig
@@ -734,8 +755,10 @@ def _run_posix(tool, patterns):
                     user_in = b""
                 if user_in:
                     os.write(master_fd, user_in)
-                    # the user interacted: don't fight them on the current prompt
-                    answerer.reset()
+                    # Suppress this visible prompt until it disappears. A plain
+                    # reset would retrack stale confirmation text and inject an
+                    # ENTER into the prompt the user is currently typing.
+                    answerer.user_interacted(screen.text())
                     continue
 
             # Inspect the screen every tick. The answerer keys on the matched
@@ -1063,8 +1086,10 @@ if WINDOWS:
                     state["user_typed"] = False
                     tail = screen.text()
                 if user_typed:
-                    # the user interacted: don't fight them on the current prompt
-                    answerer.reset()
+                    # Keep the current match suppressed until it disappears;
+                    # otherwise stale approval text can inject ENTER while the
+                    # user is typing a new prompt.
+                    answerer.user_interacted(tail)
                 else:
                     # Inspect the screen every tick. The answerer keys on the
                     # matched prompt text, so it answers a prompt that has held
